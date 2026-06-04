@@ -1,0 +1,47 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# Next.js
+.next/
+out/
+next-env.d.ts
+
+# 构建与覆盖率
+dist/
+build/
+coverage/
+
+# 环境变量
+.env
+.env.*
+!.env.example
+
+# Prisma / SQLite 本地数据
+prisma/dev.db
+prisma/dev.db-journal
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# 日志
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 编辑器
+.idea/
+.vscode/
+
+# 临时文件与原型辅助
+.superpowers/
+tmp/
+temp/
+
