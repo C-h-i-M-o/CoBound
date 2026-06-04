@@ -45,3 +45,5 @@ Thumbs.db
 tmp/
 temp/
 
+# AI交互记录
+AIChatHistory/
