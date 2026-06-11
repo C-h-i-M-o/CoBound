@@ -10,7 +10,16 @@ leantime.snippets = (function () {
         copyText.setSelectionRange(0, 99999); // For mobile devices
 
         // Copy the text inside the text field
-        navigator.clipboard.writeText(copyText.value);
+        // Prefer execCommand for HTTP compatibility; Clipboard API requires secure context
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(copyText.value);
+            } else {
+                document.execCommand('copy');
+            }
+        } catch (e) {
+            document.execCommand('copy');
+        }
 
         // Alert the copied text
         jQuery.growl({message: leantime.i18n.__("short_notifications.url_copied"), style: "success"});
@@ -19,10 +28,29 @@ leantime.snippets = (function () {
 
     var copyToClipboard = function (content) {
 
-        navigator.clipboard.writeText(content);
-
-        // Alert the copied text
-        jQuery.growl({message: leantime.i18n.__("short_notifications.url_copied"), style: "success"});
+        try {
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(content);
+            } else {
+                var ta = document.createElement('textarea');
+                ta.value = content;
+                ta.style.position = 'fixed';
+                ta.style.left = '-9999px';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+            }
+        } catch (e) {
+            var ta = document.createElement('textarea');
+            ta.value = content;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+        }
 
     };
 
