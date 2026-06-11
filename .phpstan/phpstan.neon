@@ -1,0 +1,44 @@
+parameters:
+    bootstrapFiles:
+        - bootstrap.php
+    level: 1
+    inferPrivatePropertyTypeFromConstructor: true
+    paths:
+        - ../public
+        - ../app
+        - ../.phpstan/Rules
+    excludePaths:
+        - ../app/Plugins/*/vendor/*
+        - ../app/Plugins/GoogleCalendar/*
+    scanDirectories:
+        - ../vendor
+        - ../config
+    stubFiles:
+        # Declares Leantime's runtime-registered methods (Str macros, Collection::countNested,
+        # Event::discoverListeners) so vanilla PHPStan stops reporting them as undefined.
+        - stubs/leantime-macros.stub
+    ignoreErrors:
+            # Legacy templates receive their variables from the view layer ($tpl->assign / extract)
+            # and blade files via compiled-in view data. PHPStan analyses them as plain PHP and so
+            # cannot see those variables. This is a known limitation of the template pattern, not a
+            # code defect. reportUnmatched is off because templates are mid-migration (paths come and
+            # go) and app/Plugins is a private submodule absent in CI.
+            -
+                identifier: variable.undefined
+                reportUnmatched: false
+                paths:
+                    - ../app/Domain/*/Templates/*
+                    - ../app/Views/*
+                    - ../app/Plugins/*/Templates/*
+    universalObjectCratesClasses:
+        - Leantime\Core\Configuration\Environment
+    earlyTerminatingMethodCalls:
+        Leantime\Core\UI\Templates:
+            - redirect
+            - display
+            - displayPartial
+# services:
+#    -
+#        class: Leanstan\Rules\FacadeRule
+#        tags:
+#            - phpstan.rules.rule

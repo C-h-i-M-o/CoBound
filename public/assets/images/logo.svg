@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="120" viewBox="0 0 680 120" role="img" aria-labelledby="title">
+  <title id="title">CoBound</title>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M31 68c0-23 18-41 41-41h20" stroke="#25C2B1" stroke-width="14"/>
+    <path d="M113 52c0 23-18 41-41 41H52" stroke="#4A8BFF" stroke-width="14"/>
+    <circle cx="31" cy="68" r="10" fill="#25C2B1" stroke="none"/>
+    <circle cx="113" cy="52" r="10" fill="#4A8BFF" stroke="none"/>
+  </g>
+  <text x="145" y="82" fill="#FFFFFF" font-family="Inter, Arial, sans-serif" font-size="66" font-weight="700" letter-spacing="-2">CoBound</text>
+</svg>

@@ -1,0 +1,28 @@
+name: Code Style Analysis
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "master", "*.*-dev" ]
+  pull_request:
+    branches: [ "master", "*.*-dev" ]
+
+jobs:
+  pint:
+
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: '8.3'
+        extensions: redis, gd, ldap, mbstring, pdo_mysql, zip, bcmath, exif, pcntl
+
+    - name: Install Dependencies
+      run: make build-dev
+
+    - name: Run Laravel Pint Analysis
+      run: make test-code-style

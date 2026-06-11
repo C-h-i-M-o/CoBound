@@ -1,0 +1,1030 @@
+<?php
+
+namespace Leantime\Domain\Calendar\Services;
+
+use Carbon\CarbonImmutable;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Str;
+use Leantime\Core\Auth\Permissions\RequiresPermission;
+use Leantime\Core\Configuration\Environment;
+use Leantime\Core\Domains\BaseService;
+use Leantime\Core\Events\EventDispatcher;
+use Leantime\Core\Exceptions\MissingParameterException;
+use Leantime\Core\Language as LanguageCore;
+use Leantime\Domain\Calendar\Permissions\CalendarPermissions;
+use Leantime\Domain\Calendar\Repositories\Calendar as CalendarRepository;
+use Leantime\Domain\Setting\Repositories\Setting;
+use Leantime\Domain\Tickets\Services\Tickets;
+use Ramsey\Uuid\Uuid;
+use Spatie\IcalendarGenerator\Components\Calendar as IcalCalendar;
+use Spatie\IcalendarGenerator\Components\Event as IcalEvent;
+use Spatie\IcalendarGenerator\Enums\Display;
+
+/**
+ * Calendar service: personal events, external-calendar subscriptions, and the public iCal feed.
+ *
+ * Authorization: the @api methods carry a dispatch #[RequiresPermission(calendar.*)] capability gate
+ * (project-scoped, session project — readonly+ to view, editor+ to create/edit/delete). OWNERSHIP is
+ * separate and user-based: reads that aren't already userId-scoped by the repository self-authorize
+ * in-body (row.userId === currentUserId() OR can(MANAGE)); the userId PARAMS on the external-calendar
+ * reads are ignored in favor of the session user (closing the RPC param-spoof). The iCal feed methods
+ * are NOT @api — they are served by the public, hash-authenticated /calendar/ical route.
+ */
+class Calendar extends BaseService
+{
+    private CalendarRepository $calendarRepo;
+
+    private LanguageCore $language;
+
+    private Setting $settingsRepo;
+
+    private Environment $config;
+
+    public function __construct(
+        CalendarRepository $calendarRepo,
+        LanguageCore $language,
+        Setting $settingsRepo,
+        Environment $config,
+    ) {
+        $this->calendarRepo = $calendarRepo;
+        $this->language = $language;
+        $this->settingsRepo = $settingsRepo;
+        $this->config = $config;
+    }
+
+    /**
+     * Deletes a Google Calendar.
+     *
+     * @param  int  $id  The ID of the Google Calendar to delete.
+     * @return bool Returns true if the Google Calendar was successfully deleted, false otherwise.
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::DELETE)]
+    public function deleteGCal(int $id): bool
+    {
+        return $this->calendarRepo->deleteGCal($id);
+    }
+
+    /**
+     * Patches calendar event.
+     *
+     * @param  int  $id  Id of the event to update (only events; tickets are updated via the ticket API).
+     * @param  array  $params  Key/value array of columns to update.
+     * @return bool true on success, false on failure
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::EDIT)]
+    public function patch(int $id, array $params): bool
+    {
+        // The event's owner can always change it; a cross-user override needs calendar.manage (admin+).
+        if ($this->userIsAllowedToUpdate($id)) {
+            return $this->calendarRepo->patch($id, $params);
+        }
+
+        return false;
+    }
+
+    /**
+     * Whether the current user may change the given event. The event's owner always may; a
+     * cross-user override requires calendar.manage (admin+ — replaces the legacy
+     * Auth::userIsAtLeast(admin) check, preserving the same admin-only override).
+     *
+     * @param  int  $eventId  Id of event to be checked
+     * @return bool true when allowed, false otherwise
+     */
+    private function userIsAllowedToUpdate($eventId): bool
+    {
+        if ($this->can(CalendarPermissions::MANAGE)) {
+            return true;
+        }
+
+        $event = $this->calendarRepo->getEvent($eventId);
+
+        return $event && (int) ($event['userId'] ?? 0) === $this->currentUserId();
+    }
+
+    /**
+     * Adds a new event to the user's calendar
+     *
+     *
+     * @params array $values array of event values
+     *
+     * @return int|false returns the id on success, false on failure
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::CREATE)]
+    public function addEvent(array $values): int|false
+    {
+        $values['allDay'] = $values['allDay'] ?? false;
+
+        if (isset($values['dateFrom'])) {
+            try {
+                $timeFrom = $values['timeFrom'] ?? null;
+                $values['dateFrom'] = dtHelper()->parseUserDateTime(
+                    $values['dateFrom'],
+                    $timeFrom
+                )->formatDateTimeForDb();
+            } catch (\Exception $e) {
+                // Silent exception handling
+            }
+        }
+
+        if (isset($values['dateTo'])) {
+            try {
+                $timeTo = $values['timeTo'] ?? null;
+                $values['dateTo'] = dtHelper()->parseUserDateTime(
+                    $values['dateTo'],
+                    $timeTo
+                )->formatDateTimeForDb();
+            } catch (\Exception $e) {
+                // Silent exception handling
+            }
+        }
+
+        if ($values['description'] !== '') {
+            $result = $this->calendarRepo->addEvent($values);
+
+            // Trigger event for plugins
+            EventDispatcher::dispatch_event('afterCalendarSave', ['eventId' => $result, 'values' => $values]);
+
+            return $result;
+        } else {
+            return false;
+        }
+    }
+
+    /**
+     * Returns a single event, fail-closed to its owner. The repository fetches by bare id, so
+     * without this check any user could read any event by id over RPC; calendar.manage (admin+)
+     * is the cross-user override. Soft-denies (returns false) for a foreign event.
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::VIEW)]
+    public function getEvent(int $eventId): mixed
+    {
+        $event = $this->calendarRepo->getEvent($eventId);
+
+        if ($event === false || $event === null) {
+            return $event;
+        }
+
+        if ((int) ($event['userId'] ?? 0) !== $this->currentUserId() && ! $this->can(CalendarPermissions::MANAGE)) {
+            return false;
+        }
+
+        return $event;
+    }
+
+    /**
+     * edits an event on the user's calendar
+     * Important: Time needs to come in as user formatted time value.
+     *
+     *
+     * @params array $values array of event values
+     *
+     * @return bool returns true on success, false on failure
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::EDIT)]
+    public function editEvent(array $values): bool
+    {
+        if (isset($values['id']) === true) {
+            $id = $values['id'];
+
+            $row = $this->calendarRepo->getEvent($id);
+
+            if ($row === false) {
+                return false;
+            }
+
+            if (isset($values['allDay']) === true) {
+                $allDay = 'true';
+            } else {
+                $allDay = 'false';
+            }
+
+            $values['allDay'] = $allDay;
+
+            if (isset($values['dateFrom'])) {
+                try {
+                    $timeFrom = $values['timeFrom'] ?? null;
+                    $values['dateFrom'] = dtHelper()->parseUserDateTime(
+                        $values['dateFrom'],
+                        $timeFrom
+                    )->formatDateTimeForDb();
+                } catch (\Exception $e) {
+                    // Silent exception handling
+                }
+            }
+
+            if (isset($values['dateTo'])) {
+                try {
+                    $timeTo = $values['timeTo'] ?? null;
+                    $values['dateTo'] = dtHelper()->parseUserDateTime(
+                        $values['dateTo'],
+                        $timeTo
+                    )->formatDateTimeForDb();
+                } catch (\Exception $e) {
+                    // Silent exception handling
+                }
+            }
+
+            if ($values['description'] !== '') {
+                $this->calendarRepo->editEvent($values, $id);
+
+                // Trigger event for plugins
+                EventDispatcher::dispatch_event('afterCalendarSave', ['eventId' => $id, 'values' => $values]);
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * deletes an event on the user's calendar
+     *
+     *
+     *
+     * @return int|false returns the id on success, false on failure
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::DELETE)]
+    public function delEvent(int $id): int|false
+    {
+        // Trigger event for plugins
+        EventDispatcher::dispatch_event('afterCalendarDelete', ['eventId' => $id]);
+
+        return $this->calendarRepo->delPersonalEvent($id);
+    }
+
+    /**
+     * Returns one external-calendar subscription, scoped to the SESSION user. The $userId argument
+     * is retained for signature/RPC compatibility but IGNORED for authorization — otherwise an RPC
+     * caller could read another user's subscription by passing a foreign id.
+     *
+     * @return array|false
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::VIEW)]
+    public function getExternalCalendar(int $id, int $userId): bool|array
+    {
+        return $this->calendarRepo->getExternalCalendar($id, $this->currentUserId() ?? 0);
+    }
+
+    /**
+     * Returns the raw iCal content for an external calendar, using a
+     * session-based cache with a 30 minute time to live.
+     *
+     * Looks up the cached content for the given calendar in the session and
+     * returns it when still fresh. Otherwise it resolves the external
+     * calendar's URL, fetches its content (with SSRF protection via
+     * {@see loadIcalUrl()}), stores it in the session cache and returns it.
+     * Any fetch failure resolves to an empty string, matching the previous
+     * controller behaviour.
+     *
+     * @param  int  $calId  The external calendar id.
+     * @param  int  $userId  Retained for signature compatibility; the underlying read is pinned to
+     *                       the session user via getExternalCalendar().
+     * @return string The iCal content, or an empty string when unavailable.
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::VIEW)]
+    public function getCachedExternalCalendarContent(int $calId, int $userId): string
+    {
+        $cacheTime = 60 * 30; // 30min
+
+        if (! session()->exists('calendarCache')) {
+            session(['calendarCache' => []]);
+        }
+
+        $isCacheFresh = session()->exists('calendarCache.'.$calId)
+            && session()->exists('calendarCache.'.$calId.'.lastUpdate')
+            && session('calendarCache.'.$calId.'.lastUpdate') > time() - $cacheTime;
+
+        if ($isCacheFresh) {
+            return (string) session('calendarCache.'.$calId.'.content');
+        }
+
+        $cal = $this->getExternalCalendar($calId, $userId);
+
+        if (! isset($cal['url'])) {
+            return '';
+        }
+
+        try {
+            // loadIcalUrl includes SSRF protection.
+            $content = $this->loadIcalUrl($cal['url']);
+            session(['calendarCache.'.$calId.'.lastUpdate' => time()]);
+            session(['calendarCache.'.$calId.'.content' => $content]);
+
+            return $content;
+        } catch (\Exception $e) {
+            return '';
+        }
+    }
+
+    /**
+     * Edits an external-calendar subscription. The repository scopes the update to the session
+     * user (WHERE userId = session), so a foreign id is a no-op.
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::EDIT)]
+    public function editExternalCalendar(array $values, int $id): void
+    {
+        $this->calendarRepo->editGUrl($values, $id);
+    }
+
+    /**
+     * Retrieves all external calendars for a given user.
+     *
+     * @param  int  $userId  Retained for signature/RPC compatibility but IGNORED — the list is
+     *                       always scoped to the SESSION user, closing the cross-user param spoof.
+     * @return array|false The external calendars or false if none found
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::VIEW)]
+    public function getMyExternalCalendars(int $userId): array|false
+    {
+        return $this->calendarRepo->getMyExternalCalendars($this->currentUserId() ?? 0);
+    }
+
+    /**
+     * Adds a new external calendar URL.
+     *
+     * @param  array  $values  The calendar values (url, name, colorClass)
+     *
+     * @api
+     */
+    #[RequiresPermission(CalendarPermissions::CREATE)]
+    public function addExternalCalendarUrl(array $values): void
+    {
+        $this->calendarRepo->addGUrl($values);
+    }
+
+    /**
+     * Retrieves iCal calendar by user hash and calendar hash.
+     *
+     * @param  string  $userHash  The hash of the user.
+     * @param  string  $calHash  The hash of the calendar.
+     * @return IcalCalendar The iCal calendar generated from the calendar events.
+     *
+     * @throws MissingParameterException If either user hash or calendar hash is empty.
+     *
+     * Not @api: served by the PUBLIC, hash-authenticated /calendar/ical route (no session). The
+     * userHash+calHash secrets ARE the credential; exposing it over JSON-RPC would let a caller
+     * brute-force feeds. The Ical controller calls it internally.
+     */
+    public function getIcalByHash(string $userHash, string $calHash): IcalCalendar
+    {
+
+        if (empty($userHash) || empty($calHash)) {
+            throw new MissingParameterException('userHash and calendar hash are required');
+        }
+
+        $calendarEvents = $this->calendarRepo->getCalendarBySecretHash($userHash, $calHash);
+
+        if (! $calendarEvents) {
+            throw new \Exception('Calendar could not be retrieved');
+        }
+
+        $eventObjects = [];
+        // Create array of event objects for ical generator
+        foreach ($calendarEvents as $event) {
+
+            try {
+
+                $description = str_replace("\r\n", '\\n', strip_tags($event['description']));
+
+                $currentEvent = IcalEvent::create()
+                    ->image(BASE_URL.'/dist/images/favicon.png', 'image/png', Display::badge())
+                    ->startsAt(dtHelper()->parseDbDateTime($event['dateFrom'])->setToUserTimezone())
+                    ->endsAt(dtHelper()->parseDbDateTime($event['dateTo'])->setToUserTimezone())
+                    ->name($event['title'])
+                    ->description($description)
+                    ->uniqueIdentifier($event['id'])
+                    ->url($event['url'] ?? '');
+
+                if ($event['allDay'] === true) {
+                    $currentEvent->fullDay();
+                }
+
+                if ($event['eventType'] == 'ticket' && $event['dateContext'] == 'due') {
+                    $currentEvent->alertMinutesBefore(30, $this->language->__('text.ical.todo_is_due'));
+                }
+
+                if ($event['eventType'] == 'ticket' && $event['dateContext'] == 'edit') {
+                    $currentEvent->alertMinutesBefore(5, $this->language->__('text.ical.todo_start_alert'));
+                }
+
+                $eventObjects[] = $currentEvent;
+
+            } catch (\Exception $e) {
+                // Do not include event in ical
+                Log::error($e);
+            }
+        }
+
+        $icalCalendar = IcalCalendar::create($this->language->__('text.ical_title'))->event($eventObjects);
+
+        return $icalCalendar;
+    }
+
+    public function getCalendar(int $userId, null|string|CarbonImmutable $from = null, null|string|CarbonImmutable $until = null): array
+    {
+        // Convert date parameters to Carbon instances if they're strings
+        if (is_string($from)) {
+            $from = CarbonImmutable::parse($from);
+        }
+        if (is_string($until)) {
+            $until = CarbonImmutable::parse($until);
+        }
+
+        // Get tickets and filter by date range
+        $ticketService = app()->make(Tickets::class);
+        $dbTickets = $ticketService->getOpenUserTicketsThisWeekAndLater($userId, '', true);
+
+        $tickets = [];
+        if (isset($dbTickets['thisWeek']['tickets'])) {
+            $tickets = array_merge($tickets, $dbTickets['thisWeek']['tickets']);
+        }
+
+        if (isset($dbTickets['later']['tickets'])) {
+            $tickets = array_merge($tickets, $dbTickets['later']['tickets']);
+        }
+
+        if (isset($dbTickets['overdue']['tickets'])) {
+            $tickets = array_merge($tickets, $dbTickets['overdue']['tickets']);
+        }
+
+        $dbUserEvents = $this->calendarRepo->getAll($userId, $from, $until);
+
+        $newValues = [];
+        foreach ($dbUserEvents as $value) {
+            $allDay = filter_var($value['allDay'], FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+
+            // Filter events by date range if specified. Use dtHelper()
+            // rather than CarbonImmutable::parse directly so the
+            // existing isValidDateString() guard catches MySQL zero-date
+            // sentinel (`0000-00-00 00:00:00`), epoch sentinel
+            // (`1969-12-31 00:00:00`), and empty values BEFORE parsing,
+            // and so the parse itself respects Leantime's DB timezone.
+            // Without this, one bad row took down the entire getCalendar
+            // response with a -32000 server error.
+            if ($from || $until) {
+                try {
+                    $eventStart = dtHelper()->parseDbDateTime($value['dateFrom'] ?? '');
+                    $eventEnd = dtHelper()->parseDbDateTime($value['dateTo'] ?? '');
+                } catch (\Exception $e) {
+                    // Invalid stored date — skip this event rather than
+                    // killing the feed. SQL audit + cleanup of zero-date
+                    // rows is a separate operations task.
+                    continue;
+                }
+
+                if ($from && $eventEnd < $from) {
+                    continue;
+                }
+                if ($until && $eventStart > $until) {
+                    continue;
+                }
+            }
+
+            $newValues[] = [
+                'title' => $value['description'],
+                'allDay' => $allDay,
+                'description' => '',
+                'dateFrom' => $value['dateFrom'],
+                'dateTo' => $value['dateTo'],
+                'id' => $value['id'],
+                'projectId' => '',
+                'eventType' => 'calendar',
+                'dateContext' => 'plan',
+                'backgroundColor' => 'var(--accent1)',
+                'borderColor' => 'var(--accent1)',
+                'url' => BASE_URL.'/calendar/showMyCalendar/#/calendar/editEvent/'.$value['id'],
+            ];
+        }
+
+        if (count($tickets)) {
+            $statusLabelsArray = [];
+
+            foreach ($tickets as $ticket) {
+                if (! isset($statusLabelsArray[$ticket['projectId']])) {
+                    $statusLabelsArray[$ticket['projectId']] = $ticketService->getStatusLabels(
+                        $ticket['projectId']
+                    );
+                }
+
+                if (isset($statusLabelsArray[$ticket['projectId']][$ticket['status']])) {
+                    $statusName = $statusLabelsArray[$ticket['projectId']][$ticket['status']]['name'];
+                    $statusColor = $this->calendarRepo->classColorMap[$statusLabelsArray[$ticket['projectId']][$ticket['status']]['class']];
+                } else {
+                    $statusName = '';
+                    $statusColor = 'var(--grey)';
+                }
+
+                $backgroundColor = 'var(--accent2)';
+
+                if (dtHelper()->isValidDateString($ticket['dateToFinish'])) {
+
+                    $context = '❕ '.$this->language->__('label.due_todo');
+
+                    $dueDate = dtHelper()->parseDbDateTime($ticket['dateToFinish']);
+                    if ($from || $until) {
+
+                        if ($from && $dueDate < $from) {
+                            continue;
+                        }
+                        if ($until && $dueDate > $until) {
+                            continue;
+                        }
+                    }
+
+                    // Detect if the due date has no specific time set (stored as end-of-day 23:59:59).
+                    // If so, treat it as an all-day event to avoid timezone boundary issues
+                    // that cause the event to appear on two days in the calendar.
+                    $isEndOfDay = $dueDate->format('H:i:s') === '23:59:59';
+                    $allDay = $isEndOfDay;
+
+                    $newValues[] = $this->mapEventData(
+                        title: $context.$ticket['headline'].' ('.$statusName.')',
+                        description: $ticket['description'],
+                        allDay: $allDay,
+                        id: $ticket['id'],
+                        projectId: $ticket['projectId'],
+                        eventType: 'ticket',
+                        dateContext: 'due',
+                        backgroundColor: $backgroundColor,
+                        borderColor: $statusColor,
+                        dateFrom: $ticket['dateToFinish'],
+                        dateTo: $ticket['dateToFinish']
+                    );
+                }
+
+                if (dtHelper()->isValidDateString($ticket['editFrom'])) {
+
+                    // Set ticket to all-day ticket when no time is set
+                    $dateFrom = dtHelper()->parseDbDateTime($ticket['editFrom']);
+                    $dateTo = dtHelper()->parseDbDateTime($ticket['editTo']);
+
+                    if ($from || $until) {
+
+                        if ($from && $dateFrom < $from) {
+                            continue;
+                        }
+                        if ($until && $dateTo > $until) {
+                            continue;
+                        }
+                    }
+
+                    $allDay = false;
+                    if ($dateFrom->diffInDays($dateTo) >= 1) {
+                        $allDay = true;
+                    }
+
+                    $context = $this->language->__('label.planned_edit');
+
+                    $newValues[] = $this->mapEventData(
+                        title: $context.$ticket['headline'].' ('.$statusName.')',
+                        description: $ticket['description'],
+                        allDay: $allDay,
+                        id: $ticket['id'],
+                        projectId: $ticket['projectId'],
+                        eventType: 'ticket',
+                        dateContext: 'edit',
+                        backgroundColor: $backgroundColor,
+                        borderColor: $statusColor,
+                        dateFrom: $ticket['editFrom'],
+                        dateTo: $ticket['editTo']
+                    );
+                }
+            }
+        }
+
+        return $newValues;
+    }
+
+    public function getICalUrl()
+    {
+        $userId = -1;
+        if (! empty(session('userdata.id'))) {
+            $userId = session('userdata.id');
+        }
+
+        $userHash = hash('sha1', $userId.$this->config->sessionPassword);
+        $icalHash = $this->settingsRepo->getSetting('usersettings.'.$userId.'.icalSecret');
+
+        if (empty($icalHash)) {
+            throw new \Exception('User has no ical hash');
+        }
+
+        return BASE_URL.'/calendar/ical/'.$icalHash.'_'.$userHash;
+    }
+
+    /**
+     * Resolves an iCal request token into the iCal calendar.
+     *
+     * The token follows the same `{icalHash}_{userHash}` format produced by
+     * {@see getICalUrl()}. It may arrive either as the request id (the raw
+     * `{icalHash}_{userHash}` string) or embedded as the third dot-separated
+     * segment of the frontcontroller `act` value
+     * (`calendar.ical.{icalHash}_{userHash}`).
+     *
+     * @param  string  $token  The raw id token, may be empty.
+     * @param  string  $act  The frontcontroller act string, may be empty.
+     * @return IcalCalendar The iCal calendar for the resolved hashes.
+     *
+     * @throws MissingParameterException If the token does not contain both hashes.
+     * @throws \Exception If the calendar could not be retrieved.
+     *
+     * Not @api: the entry point for the PUBLIC, hash-authenticated /calendar/ical route (no
+     * session) — the Ical controller calls it directly. Not exposed via JSON-RPC (delegates to
+     * getIcalByHash, where the hashes are the credential).
+     */
+    public function getIcalByRequestToken(string $token, string $act = ''): IcalCalendar
+    {
+        $actParts = explode('.', $act);
+
+        if (count($actParts) === 3) {
+            $rawToken = $actParts[2];
+        } else {
+            $rawToken = $token;
+        }
+
+        $idParts = explode('_', $rawToken);
+
+        if (count($idParts) !== 2) {
+            throw new MissingParameterException('iCal token must contain both an iCal hash and a user hash');
+        }
+
+        // idParts[0] = iCal hash (calHash), idParts[1] = user hash.
+        return $this->getIcalByHash($idParts[1], $idParts[0]);
+    }
+
+    /**
+     * Gets all events from external calendars for a user
+     *
+     * @param  int  $userId  The user ID to get external calendar events for
+     * @param  null|string|CarbonImmutable  $from  The start date to filter events by
+     * @param  null|string|CarbonImmutable  $until  The end date to filter events by
+     * @return array Array of calendar events from all external calendars
+     */
+    public function getExternalCalendarEvents(null|string|CarbonImmutable $from = null, null|string|CarbonImmutable $until = null): array
+    {
+        $cacheKey = 'calendar.external.'.session('userdata.id');
+        $cached = Cache::get($cacheKey);
+        if (is_array($cached) && ! empty($cached)) {
+            return $cached;
+        }
+
+        // Get all external calendars for the user
+        $externalCalendars = $this->calendarRepo->getMyExternalCalendars(session('userdata.id'));
+
+        if (empty($externalCalendars)) {
+            return [];
+        }
+
+        $allEvents = [];
+
+        // Convert date parameters to Carbon instances if they're strings
+        try {
+            if (is_string($from)) {
+                $from = CarbonImmutable::parse($from);
+            }
+            if (is_string($until)) {
+                $until = CarbonImmutable::parse($until);
+            }
+        } catch (\Exception $e) {
+            Log::error('Error converting date parameters to Carbon instances: '.$e->getMessage());
+            Log::error($e);
+
+            return [];
+        }
+
+        foreach ($externalCalendars as $calendar) {
+            try {
+                // Load the iCal data using existing functionality
+                $icalContent = $this->loadIcalUrl($calendar['url']);
+
+                // Parse the iCal data into events
+                $parser = new \ICal\ICal;
+                $parser->initString($icalContent);
+
+                $events = $parser->events();
+
+                // Filter events by date range if specified
+                if ($from || $until) {
+                    $events = array_filter($events, function ($event) use ($from, $until) {
+                        $eventStart = CarbonImmutable::parse($event->dtstart);
+                        $eventEnd = isset($event->dtend) ? CarbonImmutable::parse($event->dtend) : $eventStart;
+
+                        if ($from && $eventEnd < $from) {
+                            return false;
+                        }
+                        if ($until && $eventStart > $until) {
+                            return false;
+                        }
+
+                        return true;
+                    });
+                }
+
+                // Transform each event into our standard format
+                foreach ($events as $event) {
+
+                    if (Str::endsWith($event->dtstart, 'Z')) {
+                        $dtstart = dtHelper()->parseDbDateTime($event->dtstart)->formatDateTimeForDb();
+                    } else {
+                        $dtstart = dtHelper()->parseUserDateTime($event->dtstart)->formatDateTimeForDb();
+                    }
+
+                    if (Str::endsWith($event->dtend, 'Z')) {
+                        $dtend = dtHelper()->parseDbDateTime($event->dtend)->formatDateTimeForDb();
+                    } else {
+                        $dtend = dtHelper()->parseUserDateTime($event->dtend)->formatDateTimeForDb();
+                    }
+
+                    $allEvents[] = [
+                        'title' => $event->summary,
+                        'description' => $event->description ?? '',
+                        'dateFrom' => $dtstart,
+                        'dateTo' => $dtend,
+                        'allDay' => isset($event->dtstart_array[3]) ? false : true,
+                        'id' => $event->uid,
+                        'projectId' => '',
+                        'eventType' => 'external',
+                        'dateContext' => 'plan',
+                        'backgroundColor' => $calendar['colorClass'],
+                        'borderColor' => $calendar['colorClass'],
+                        'url' => $event->url ?? '',
+                        'source' => $calendar['name'],
+                    ];
+                }
+
+            } catch (\Exception $e) {
+                // Log error but continue with other calendars
+                Log::error("Error fetching calendar {$calendar['name']}: ".$e->getMessage());
+
+                continue;
+            }
+        }
+
+        Cache::put('calendar.external.'.session('userdata.id'), $allEvents, 240);
+
+        return $allEvents;
+    }
+
+    /**
+     * Validates that a URL is safe to fetch, preventing SSRF attacks.
+     *
+     * Checks that the URL uses an allowed scheme (http/https) and that
+     * the resolved IP address is not in a private or reserved range.
+     *
+     * @param  string  $url  The URL to validate.
+     * @return bool True if the URL is safe to fetch, false otherwise.
+     */
+    private function isUrlSafe(string $url): bool
+    {
+        $parsed = parse_url($url);
+
+        if ($parsed === false || ! isset($parsed['scheme']) || ! isset($parsed['host'])) {
+            return false;
+        }
+
+        // Only allow http and https schemes
+        $allowedSchemes = ['http', 'https'];
+        if (! in_array(strtolower($parsed['scheme']), $allowedSchemes, true)) {
+            Log::warning('Calendar SSRF protection: blocked disallowed scheme', [
+                'scheme' => $parsed['scheme'],
+                'url' => $url,
+            ]);
+
+            return false;
+        }
+
+        // Resolve hostname and validate ALL returned IP addresses (A and AAAA records).
+        // This prevents bypasses via multi-homed hosts where one IP is public and another is private.
+        $host = $parsed['host'];
+
+        // If the host is already an IP literal, validate it directly
+        if (filter_var($host, FILTER_VALIDATE_IP)) {
+            if (! $this->isIpAllowed($host)) {
+                Log::warning('Calendar SSRF protection: blocked IP literal', ['ip' => $host]);
+
+                return false;
+            }
+
+            return true;
+        }
+
+        // Resolve all A (IPv4) and AAAA (IPv6) records
+        $ipv4Records = @dns_get_record($host, DNS_A) ?: [];
+        $ipv6Records = @dns_get_record($host, DNS_AAAA) ?: [];
+
+        $allIps = [];
+        foreach ($ipv4Records as $record) {
+            $allIps[] = $record['ip'] ?? null;
+        }
+        foreach ($ipv6Records as $record) {
+            $allIps[] = $record['ipv6'] ?? null;
+        }
+
+        $allIps = array_filter($allIps);
+
+        if (empty($allIps)) {
+            Log::warning('Calendar SSRF protection: unable to resolve hostname', ['host' => $host]);
+
+            return false;
+        }
+
+        // Every resolved IP must be allowed — block if any single record is private/reserved
+        foreach ($allIps as $ip) {
+            if (! $this->isIpAllowed($ip)) {
+                Log::warning('Calendar SSRF protection: blocked private/reserved IP', [
+                    'host' => $host,
+                    'resolved_ip' => $ip,
+                ]);
+
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Checks whether an IP address (IPv4 or IPv6) is allowed for outbound requests.
+     *
+     * Rejects loopback, private, reserved, and link-local addresses.
+     * Uses PHP's built-in FILTER_VALIDATE_IP flags for IPv6 and manual CIDR checks for IPv4.
+     *
+     * @param  string  $ip  The IP address to validate.
+     * @return bool True if the IP is safe for outbound requests.
+     */
+    private function isIpAllowed(string $ip): bool
+    {
+        // IPv6 validation using PHP's built-in filters
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+            // Reject any IPv6 address that is loopback, private, or reserved
+            if (! filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return false;
+            }
+
+            return true;
+        }
+
+        // IPv4 CIDR range checks
+        $denyRanges = [
+            '127.0.0.0/8',      // Loopback
+            '10.0.0.0/8',       // Private (Class A)
+            '172.16.0.0/12',    // Private (Class B)
+            '192.168.0.0/16',   // Private (Class C)
+            '169.254.0.0/16',   // Link-local
+            '0.0.0.0/8',       // Current network
+        ];
+
+        foreach ($denyRanges as $range) {
+            if ($this->ipInRange($ip, $range)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Checks whether an IPv4 address falls within a given CIDR range.
+     *
+     * @param  string  $ip  The IPv4 address to check.
+     * @param  string  $range  The CIDR range (e.g. "10.0.0.0/8").
+     * @return bool True if the IP is within the range, false otherwise.
+     */
+    private function ipInRange(string $ip, string $range): bool
+    {
+        [$subnet, $bits] = explode('/', $range);
+
+        $ipLong = ip2long($ip);
+        $subnetLong = ip2long($subnet);
+
+        if ($ipLong === false || $subnetLong === false) {
+            return false;
+        }
+
+        $mask = -1 << (32 - (int) $bits);
+        $subnetLong &= $mask;
+
+        return ($ipLong & $mask) === $subnetLong;
+    }
+
+    /**
+     * Load an iCal URL and return its contents.
+     *
+     * Validates the URL against SSRF attacks before making the request.
+     *
+     * @param  string  $url  The URL of the iCal feed.
+     * @return string The iCal content.
+     *
+     * @throws \Exception If the URL is unsafe or there is an error loading the URL.
+     */
+    public function loadIcalUrl(string $url): string
+    {
+        if (str_contains($url, 'webcal://')) {
+            $url = str_replace('webcal://', 'https://', $url);
+        }
+
+        if (! $this->isUrlSafe($url)) {
+            throw new \Exception('Refused to fetch iCal feed: URL failed SSRF safety check');
+        }
+
+        $client = new \GuzzleHttp\Client;
+
+        try {
+            $response = $client->get($url, [
+                'headers' => [
+                    'Accept' => 'text/calendar',
+                    'User-Agent' => 'Leantime Calendar Integration v'.$this->config->appVersion,
+                ],
+            ]);
+
+            if ($response->getStatusCode() == 200) {
+                return (string) $response->getBody();
+            }
+
+            throw new \Exception('Failed to load iCal feed: HTTP '.$response->getStatusCode());
+        } catch (\Exception $e) {
+            throw new \Exception('Error loading iCal feed: '.$e->getMessage());
+        }
+    }
+
+    public function generateIcalHash()
+    {
+
+        if (empty(session('userdata.id'))) {
+            throw new \Exception('Session id is not set.');
+        }
+
+        $uuid = Uuid::uuid4();
+        $icalHash = $uuid->toString();
+
+        $this->settingsRepo->saveSetting('usersettings.'.session('userdata.id').'.icalSecret', $icalHash);
+
+    }
+
+    /**
+     * Generates an event array for fullcalendar.io frontend.
+     *
+     * @param  int|null  $dateFrom
+     * @param  int|null  $dateTo
+     */
+    private function mapEventData(
+        string $title,
+        ?string $description,
+        bool $allDay,
+        ?int $id,
+        ?int $projectId,
+        string $eventType,
+        string $dateContext,
+        ?string $backgroundColor,
+        ?string $borderColor,
+        ?string $dateFrom,
+        ?string $dateTo
+    ): array {
+        // Ticket records in MySQL can legitimately have NULL for any of
+        // the user-facing optional fields here (description, dates, colours)
+        // AND for the foreign-key-style id columns (orphaned tickets, soft-
+        // deleted projects, etc.). PHP 8's strict-type declarations rejected
+        // those with a hard 500. Widening the genuinely-nullable params to
+        // accept null and coercing to safe defaults (empty string / 0)
+        // in the output preserves the payload shape for calendar
+        // consumers — both mobile and web expect strings + numeric ids
+        // — without rewriting every call site or pre-filtering at the
+        // query layer.
+        return [
+            'title' => $title,
+            'allDay' => $allDay,
+            'description' => $description ?? '',
+            'dateFrom' => $dateFrom ?? '',
+            'dateTo' => $dateTo ?? '',
+            'id' => $id ?? 0,
+            'projectId' => $projectId ?? 0,
+            'eventType' => $eventType,
+            'dateContext' => $dateContext,
+            'backgroundColor' => $backgroundColor ?? '',
+            'borderColor' => $borderColor ?? '',
+            'url' => BASE_URL.'/dashboard/home/#/tickets/showTicket/'.($id ?? 0),
+        ];
+    }
+}

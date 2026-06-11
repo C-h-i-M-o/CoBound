@@ -1,0 +1,153 @@
+<?php
+
+namespace Leantime\Domain\Reactions\Services;
+
+/**
+ * @api
+ */
+class Reactions
+{
+    /**
+     * @var \Leantime\Domain\Reactions\Repositories\Reactions reactions repository
+     *
+     * @api
+     */
+    private \Leantime\Domain\Reactions\Repositories\Reactions $reactionsRepo;
+
+    public function __construct(\Leantime\Domain\Reactions\Repositories\Reactions $reactionsRepo)
+    {
+        $this->reactionsRepo = $reactionsRepo;
+    }
+
+    /**
+     * Adds a reaction on behalf of the CURRENT (session) user.
+     *
+     * JSON-RPC entry point: derives the user from the session rather than
+     * accepting a userId, so a caller cannot react as another user.
+     *
+     * @param  string  $module  The entity module (e.g. 'tickets')
+     * @param  int  $moduleId  The entity id
+     * @param  string  $reaction  The reaction key
+     * @return bool True if the reaction was added
+     *
+     * @api
+     */
+    public function react(string $module, int $moduleId, string $reaction): bool
+    {
+        return $this->addReaction((int) session('userdata.id'), $module, $moduleId, $reaction);
+    }
+
+    /**
+     * Removes a reaction on behalf of the CURRENT (session) user.
+     *
+     * JSON-RPC entry point: derives the user from the session rather than
+     * accepting a userId, so a caller cannot remove another user's reaction.
+     *
+     * @param  string  $module  The entity module (e.g. 'tickets')
+     * @param  int  $moduleId  The entity id
+     * @param  string  $reaction  The reaction key
+     * @return bool True if the reaction was removed
+     *
+     * @api
+     */
+    public function unreact(string $module, int $moduleId, string $reaction): bool
+    {
+        return $this->removeReaction((int) session('userdata.id'), $module, $moduleId, $reaction);
+    }
+
+    /**
+     * addReaction - adds a reaction to an entity, checks if a user has already reacted the same way
+     *
+     * Not exposed via JSON-RPC: it accepts an arbitrary $userId. Use the
+     * session-scoped react() wrapper for JSON-RPC callers.
+     */
+    public function addReaction(int $userId, string $module, int $moduleId, string $reaction): bool
+    {
+        if ($module == '' || $moduleId == '' || $userId == '' || $reaction == '') {
+            return false;
+        }
+
+        // Check if user already reacted in that category
+        $userReactions = $this->getUserReactions($userId, $module, $moduleId);
+
+        $currentReactionType = $this->getReactionType($reaction);
+
+        foreach ($userReactions as $previousReaction) {
+            if ($this->getReactionType($previousReaction['reaction']) == $currentReactionType) {
+                return false;
+            }
+        }
+
+        return $this->reactionsRepo->addReaction($userId, $module, $moduleId, $reaction);
+    }
+
+    /**
+     * getReactionType - returns the category/type of a given reaction
+     *
+     *
+     *
+     * @api
+     */
+    public function getReactionType(string $reaction): string|false
+    {
+
+        $types = \Leantime\Domain\Reactions\Models\Reactions::getReactions();
+
+        foreach ($types as $reactionType => $reactionValues) {
+            if (isset($reactionValues[$reaction])) {
+                return $reactionType;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * getGroupedEntityReactions - gets all reactions for a given entity grouped and counted by reactions
+     *
+     *
+     * @return array|bool returns the array on success or false on failure
+     *
+     * @api
+     */
+    public function getGroupedEntityReactions(string $module, int $moduleId): array|false
+    {
+        return $this->reactionsRepo->getGroupedEntityReactions($module, $moduleId);
+    }
+
+    /**
+     * getMyReactions - gets user reactions. Can be very broad or very targeted
+     *
+     *
+     *
+     * @api
+     */
+    public function getUserReactions(int $userId, string $module = '', ?int $moduleId = null, string $reaction = ''): array|false
+    {
+
+        return $this->reactionsRepo->getUserReactions($userId, $module, $moduleId, $reaction);
+    }
+
+    /**
+     * removeReaction - removes a user's reaction from an entity
+     *
+     * Not exposed via JSON-RPC (accepts an arbitrary $userId). Use the
+     * session-scoped unreact() wrapper for JSON-RPC callers.
+     */
+    public function removeReaction(int $userId, string $module, int $moduleId, string $reaction): bool
+    {
+        return $this->reactionsRepo->removeUserReaction($userId, $module, $moduleId, $reaction);
+    }
+
+    /**
+     * getEntityReactionsWithUsers - gets all reactions for an entity with user names
+     *
+     * @return array returns array grouped by reaction with user info
+     *
+     * @api
+     */
+    public function getEntityReactionsWithUsers(string $module, int $moduleId): array
+    {
+        return $this->reactionsRepo->getEntityReactionsWithUsers($module, $moduleId);
+    }
+}

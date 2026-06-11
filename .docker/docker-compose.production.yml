@@ -1,0 +1,45 @@
+services:
+  cobound-db:
+    image: mysql:8.4
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - cobound-db-data:/var/lib/mysql
+    networks:
+      - cobound-internal
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  cobound:
+    image: cobound:3.8.0-custom
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    ports:
+      - "5180:8080"
+    volumes:
+      - cobound-userfiles:/var/www/html/userfiles
+      - cobound-public-userfiles:/var/www/html/public/userfiles
+      - cobound-plugins:/var/www/html/app/Plugins
+      - cobound-logs:/var/www/html/storage/logs
+    networks:
+      - cobound-internal
+    depends_on:
+      cobound-db:
+        condition: service_healthy
+
+volumes:
+  cobound-db-data:
+  cobound-userfiles:
+  cobound-public-userfiles:
+  cobound-plugins:
+  cobound-logs:
+
+networks:
+  cobound-internal:
+    driver: bridge

@@ -1,0 +1,3098 @@
+<?php
+
+namespace Leantime\Domain\Install\Repositories;
+
+use Illuminate\Contracts\Container\BindingResolutionException;
+use Illuminate\Database\ConnectionInterface;
+use Illuminate\Database\DatabaseManager;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
+use Leantime\Core\Configuration\AppSettings as AppSettingCore;
+use Leantime\Core\Configuration\Environment;
+use Leantime\Core\Events\DispatchesEvents;
+use Leantime\Domain\Install\Services\SchemaBuilder;
+use Leantime\Domain\Menu\Repositories\Menu as MenuRepository;
+use Leantime\Domain\Setting\Repositories\Setting;
+use Leantime\Domain\Setting\Services\SettingCache;
+use PDO;
+use PDOException;
+
+class Install
+{
+    use DispatchesEvents;
+
+    public string $name;
+
+    public int $id;
+
+    /**
+     * Laravel database connection interface
+     */
+    private ConnectionInterface $connection;
+
+    /**
+     * Laravel database manager for creating connections
+     */
+    private DatabaseManager $dbManager;
+
+    /**
+     * db update scripts listed out by version number with leading zeros A.BB.CC => ABBCC
+     */
+    private array $dbUpdates = [
+        20004,
+        20100,
+        20101,
+        20102,
+        20103,
+        20104,
+        20105,
+        20106,
+        20107,
+        20108,
+        20109,
+        20110,
+        20111,
+        20112,
+        20113,
+        20114,
+        20115,
+        20116,
+        20117,
+        20118,
+        20120,
+        20121,
+        20122,
+        20401,
+        20402,
+        20405,
+        20406,
+        20407,
+        30002,
+        30003,
+        30400,
+        30408,
+        30409,
+        30410,
+        30411,
+        30412,
+        30413,
+        30500,
+        30501,
+        30502,
+        // 30503 (zp_device_tokens) intentionally skipped — superseded by
+        // 30504 which puts push columns on zp_access_tokens instead.
+        30504,
+        30505,
+        30506,
+        30507,
+        30508,
+        30509,
+        30510,
+        30511,
+        30512,
+        30513,
+        30514,
+        30515,
+        30516,
+        30517,
+        30518,
+    ];
+
+    /**
+     * config object, passed into constructor
+     */
+    private Environment|string $config;
+
+    /**
+     * appSettings object, passed into constructor
+     */
+    private string|AppSettingCore $settings;
+
+    /**
+     * __construct - get database connection using Laravel's database manager
+     */
+    public function __construct(
+        Environment $config,
+        AppSettingCore $settings,
+        DatabaseManager $dbManager
+    ) {
+        // Some scripts might take a long time to execute. Set timeout to 5minutes
+        ini_set('max_execution_time', 300);
+
+        $this->config = $config;
+        $this->settings = $settings;
+        $this->dbManager = $dbManager;
+
+        // Use Laravel's database connection for consistency with the rest of the application
+        // Detect the configured database driver (defaults to 'mysql')
+        $defaultConnection = config('database.default', 'mysql');
+
+        try {
+            $this->connection = $this->dbManager->connection($defaultConnection);
+        } catch (\Exception $e) {
+            Log::error('Failed to establish database connection during installation: '.$e->getMessage());
+            // During installation, we may need to create a temporary connection without database selection
+            $this->createTemporaryConnection();
+        }
+    }
+
+    /**
+     * returns current database object
+     */
+    public function getDBObject(): ?PDO
+    {
+        return $this->connection?->getPdo();
+    }
+
+    /**
+     * Create a temporary database connection for installation purposes
+     * This is used when the main database connection fails during installation
+     * Supports both MySQL and PostgreSQL
+     */
+    private function createTemporaryConnection(): void
+    {
+        try {
+            $driver = config('database.default', 'mysql');
+
+            if ($driver === 'pgsql') {
+                // PostgreSQL temporary connection
+                $config = [
+                    'driver' => 'pgsql',
+                    'host' => $this->config->dbHost,
+                    'port' => $this->config->dbPort ?? 5432,
+                    'database' => 'postgres', // Connect to default postgres database
+                    'username' => $this->config->dbUser,
+                    'password' => $this->config->dbPassword,
+                    'charset' => 'utf8',
+                    'prefix' => '',
+                    'search_path' => 'public',
+                    'sslmode' => env('LEAN_DB_SSLMODE', 'prefer'),
+                    'options' => [
+                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    ],
+                ];
+            } else {
+                // MySQL temporary connection (default)
+                $config = [
+                    'driver' => 'mysql',
+                    'host' => $this->config->dbHost,
+                    'port' => $this->config->dbPort ?? 3306,
+                    'username' => $this->config->dbUser,
+                    'password' => $this->config->dbPassword,
+                    'charset' => 'utf8mb4',
+                    'collation' => 'utf8mb4_unicode_ci',
+                    'options' => [
+                        PDO::MYSQL_ATTR_INIT_COMMAND => 'SET NAMES utf8mb4,sql_mode="NO_ENGINE_SUBSTITUTION"',
+                        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                    ],
+                ];
+            }
+
+            // Use Laravel's DB manager to create a temporary connection
+            config(['database.connections.install_temp' => $config]);
+            $this->connection = $this->dbManager->connection('install_temp');
+        } catch (\Exception $e) {
+            Log::error('Failed to create temporary database connection: '.$e->getMessage());
+            throw $e;
+        }
+    }
+
+    /**
+     * checkIfInstalled checks if zp user table exists (and assumes that leantime is installed)
+     */
+    public function checkIfInstalled(): bool
+    {
+
+        if (Cache::has('isInstalled') && Cache::get('isInstalled') === true) {
+            return true;
+        }
+
+        try {
+
+            // Select the database - MySQL uses USE, PostgreSQL uses search_path
+            $this->selectDatabase($this->config->dbDatabase);
+
+            $count = $this->connection->table('zp_user')->count();
+
+            Cache::set('isInstalled', true);
+
+            return true;
+        } catch (PDOException $e) {
+
+            Cache::forget('isInstalled');
+
+            Log::error($e);
+
+            return false;
+        }
+    }
+
+    /**
+     * Select/switch to a specific database
+     * Handles database-specific syntax for MySQL vs PostgreSQL
+     */
+    private function selectDatabase(string $database): void
+    {
+        $driver = $this->connection->getDriverName();
+
+        if ($driver === 'pgsql') {
+            // PostgreSQL: reconnect with the correct database
+            // Since we can't "USE" a database in PostgreSQL like MySQL,
+            // the database is specified at connection time
+            $this->connection->getPdo()->exec('SET search_path TO public');
+        } else {
+            // MySQL: USE statement
+            $this->connection->statement('USE `'.$database.'`');
+        }
+    }
+
+    /**
+     * setupDB installs database using database-agnostic Schema Builder
+     *
+     * @param  array  $values  Form values for admin user and company information
+     * @param  string  $db
+     */
+    public function setupDB(array $values, $db = ''): bool
+    {
+        try {
+            // Select the database
+            $dbName = $db ?: $this->config->dbDatabase;
+            $this->selectDatabase($dbName);
+
+            $pwReset = Str::random(32);
+            session()->put('pwReset', $pwReset);
+
+            // Use SchemaBuilder for database-agnostic table creation
+            $schemaBuilder = app()->make(SchemaBuilder::class);
+            $schemaBuilder->createAllTables();
+            $schemaBuilder->insertInitialData($values, $pwReset);
+
+            // Seed the permission engine for fresh installs: sync the domain-declared
+            // vocabulary into zp_permissions and grant the built-in roles their defaults.
+            // (update_sql_* seeds existing installs; this covers the fresh-install path.)
+            $permissionSeeder = app()->make(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $permissionSeeder->syncDiscoveredPermissions();
+            $permissionSeeder->seedBuiltInRoles();
+
+            return true;
+        } catch (\Exception $e) {
+            Log::error($e);
+
+            return false;
+        }
+    }
+
+    /**
+     * updateDB main entry point to update the db based on version number. Executes all missing db update scripts
+     *
+     * @throws BindingResolutionException
+     */
+    public function updateDB(): array|bool
+    {
+
+        // Forget all the versions we think we know and start fresh
+        session()->forget('db-version');
+        $settingsCacheService = app()->make(SettingCache::class);
+        $settingsCacheService->forget('db-version');
+
+        $errors = [];
+
+        $this->selectDatabase($this->config->dbDatabase);
+
+        $versionArray = explode('.', $this->settings->dbVersion);
+        if (is_array($versionArray) && count($versionArray) == 3) {
+            $major = $versionArray[0];
+            $minor = str_pad($versionArray[1], 2, '0', STR_PAD_LEFT);
+            $patch = str_pad($versionArray[2], 2, '0', STR_PAD_LEFT);
+            $newDBVersion = $major.$minor.$patch;
+        } else {
+            $errors[0] = 'Problem identifying the version number';
+
+            return $errors;
+        }
+
+        $setting = app()->make(Setting::class);
+        $dbVersion = $setting->getSetting('db-version');
+        $currentDBVersion = 0;
+        if ($dbVersion) {
+            $versionArray = explode('.', $dbVersion);
+            if (is_array($versionArray) && count($versionArray) == 3) {
+                $major = $versionArray[0];
+                $minor = str_pad($versionArray[1], 2, '0', STR_PAD_LEFT);
+                $patch = str_pad($versionArray[2], 2, '0', STR_PAD_LEFT);
+                $currentDBVersion = $major.$minor.$patch;
+            } else {
+                $errors[0] = 'Problem identifying the version number';
+
+                return $errors;
+            }
+        }
+
+        if ($currentDBVersion == $newDBVersion) {
+
+            session()->forget('isUpdated');
+            session()->forget('dbVersion');
+
+            return true;
+        }
+
+        // Find all update functions that need to be executed
+        foreach ($this->dbUpdates as $updateVersion) {
+            if ($currentDBVersion < $updateVersion) {
+                $functionName = 'update_sql_'.$updateVersion;
+
+                $result = $this->$functionName();
+
+                if ($result !== true) {
+                    $errors = array_merge($errors, $result);
+                } else {
+                    // Update version number in db
+                    try {
+
+                        $settingsService = app()->make(\Leantime\Domain\Setting\Services\Setting::class);
+                        $settingsService->saveSetting('db-version', $this->convert_version($updateVersion));
+
+                        // $stmn = $this->database->prepare("INSERT INTO zp_settings (`key`, `value`) VALUES ('db-version', '".$this->settings->dbVersion."') ON DUPLICATE KEY UPDATE `value` = '".$this->settings->dbVersion."'");
+                        // $stmn->execute();
+
+                        $currentDBVersion = $updateVersion;
+                    } catch (PDOException $e) {
+                        Log::error($e);
+                        Log::error($e->getTraceAsString());
+
+                        return ['There was a problem updating the database'];
+                    }
+                }
+
+                if (count($errors) > 0) {
+                    return $errors;
+                }
+            }
+        }
+
+        session()->forget('isUpdated');
+        session()->forget('dbVersion');
+
+        return true;
+    }
+
+    private function convert_version($inputVersion): string
+    {
+        // $inputVersion is in the format of 10000 and needs to be converted to 1.0.0
+        $versionString = str_pad((string) $inputVersion, 5, '0', STR_PAD_LEFT);
+
+        $major = intval(substr($versionString, 0, -4));
+        $minor = intval(substr($versionString, -4, 2));
+        $patch = intval(substr($versionString, -2));
+
+        return $major.'.'.$minor.'.'.$patch;
+    }
+
+    /**
+     * sqlPrep - returns all the create table statements
+     */
+    private function sqlPrep(): string
+    {
+
+        $sql = "
+                CREATE TABLE `zp_calendar` (
+                    `id` int(11) NOT NULL AUTO_INCREMENT,
+                    `userId` int(11) DEFAULT NULL,
+                    `dateFrom` datetime DEFAULT NULL,
+                    `dateTo` datetime DEFAULT NULL,
+                    `description` text,
+                    `kind` varchar(255) DEFAULT NULL,
+                    `allDay` varchar(10) DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_calendar_userId_dateFrom_dateTo` (`userId`, `dateFrom`, `dateTo`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_canvas` (
+                    `id` int(11) NOT NULL AUTO_INCREMENT,
+                    `title` varchar(255) DEFAULT NULL,
+                    `author` int(10) DEFAULT NULL,
+                    `created` datetime DEFAULT NULL,
+                    `projectId` INT NULL,
+                    `type` VARCHAR(45) NULL,
+                    `description` TEXT,
+                    `color` VARCHAR(50) DEFAULT 'ocean',
+                    `modified` datetime DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `ProjectIdType` (`projectId` ASC, `type` ASC),
+                    KEY `idx_canvas_type_id` (`type`, `id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_canvas_items` (
+                    `id` int(11) NOT NULL AUTO_INCREMENT,
+                    `description` MEDIUMTEXT,
+                    `assumptions` text,
+                    `data` MEDIUMTEXT,
+                    `conclusion` text,
+                    `box` varchar(255) DEFAULT NULL,
+                    `author` int(11) DEFAULT NULL,
+                    `created` datetime DEFAULT NULL,
+                    `modified` datetime DEFAULT NULL,
+                    `canvasId` int(11) DEFAULT NULL,
+                    `sortindex` int(11) DEFAULT NULL,
+                    `status` varchar(255) DEFAULT NULL,
+                    `relates` varchar(255) DEFAULT NULL,
+                    `milestoneId` VARCHAR(255) NULL,
+                    `title` varchar(255) NULL,
+                    `parent` int NULL,
+                    `featured` int NULL,
+                    `tags` text NULL,
+                    `kpi` INT NULL DEFAULT NULL,
+                    `data1` MEDIUMTEXT NULL DEFAULT NULL,
+                    `data2` MEDIUMTEXT NULL DEFAULT NULL,
+                    `data3` MEDIUMTEXT NULL DEFAULT NULL,
+                    `data4` MEDIUMTEXT NULL DEFAULT NULL,
+                    `data5` MEDIUMTEXT NULL DEFAULT NULL,
+                    `startDate` DATETIME NULL DEFAULT NULL,
+                    `endDate` DATETIME NULL DEFAULT NULL,
+                    `setting` TEXT NULL DEFAULT NULL,
+                    `metricType` VARCHAR(45) DEFAULT NULL,
+                    `startValue` double(10,2) NULL DEFAULT NULL,
+                    `currentValue` double(10,2) NULL DEFAULT NULL,
+                    `endValue` double(10,2) NULL DEFAULT NULL,
+                    `impact` INT NULL DEFAULT NULL,
+                    `effort` INT NULL DEFAULT NULL,
+                    `probability` INT NULL DEFAULT NULL,
+                    `action` TEXT NULL DEFAULT NULL,
+                    `assignedTo` INT NULL DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `CanvasLookUp` (`canvasId` ASC, `box` ASC),
+                    KEY `idx_canvas_items_box_milestoneId` (`box`, `milestoneId`),
+                    KEY `idx_canvas_items_box_status_author` (`box`, `status`, `author`),
+                    KEY `idx_canvas_items_parent_title` (`parent`, `title`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_approvals` (
+                    `id` int auto_increment,
+                    `module` varchar(100) NULL,
+                    `entityId` int NULL,
+                    `requestorId` int NULL,
+                    `approverId` int NULL,
+                    `approvalStatus` int NULL,
+                    `requestedOn` datetime NULL,
+                    `lastStatusChange` datetime NULL,
+                    PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_clients` (
+                    `id` int(11) NOT NULL AUTO_INCREMENT,
+                    `name` varchar(200) DEFAULT NULL,
+                    `street` varchar(200) DEFAULT NULL,
+                    `zip` int(10) DEFAULT NULL,
+                    `city` varchar(50) DEFAULT NULL,
+                    `state` varchar(50) DEFAULT NULL,
+                    `country` varchar(50) DEFAULT NULL,
+                    `phone` varchar(50) DEFAULT NULL,
+                    `internet` varchar(200) DEFAULT NULL,
+                    `published` int(1) DEFAULT NULL,
+                    `age` int(3) DEFAULT NULL,
+                    `email` varchar(255) DEFAULT NULL,
+                    `modified` datetime DEFAULT NULL,
+                    PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                INSERT INTO `zp_clients`(`id`,`name`,`street`,`zip`,`city`,`state`,`country`,`phone`,`internet`,`published`,`age`,`email`) VALUES (1,:company,'',0,'','','','','',NULL,NULL,'');
+
+                CREATE TABLE `zp_comment` (
+                    `id` int(11) unsigned NOT NULL AUTO_INCREMENT,
+                    `module` varchar(200) DEFAULT NULL,
+                    `userId` int(11) DEFAULT NULL,
+                    `commentParent` int(11) DEFAULT NULL,
+                    `date` datetime DEFAULT NULL,
+                    `moduleId` int(11) DEFAULT NULL,
+                    `text` text,
+                    `status` varchar(50) null,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_comment_moduleId_module_commentParent` (`moduleId`, `module`, `commentParent`),
+                    KEY `idx_comment_userId_module` (`userId`, `module`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_file` (
+                    `id` int(11) unsigned NOT NULL AUTO_INCREMENT,
+                    `module` enum('project','ticket','client','user','lead','export','private') DEFAULT NULL,
+                    `moduleId` int(11) DEFAULT NULL,
+                    `userId` int(11) DEFAULT NULL,
+                    `extension` varchar(10) DEFAULT NULL,
+                    `encName` varchar(255) DEFAULT NULL,
+                    `realName` varchar(255) DEFAULT NULL,
+                    `date` datetime DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_file_module_moduleId_userId` (`module`, `moduleId`, `userId`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_gcallinks` (
+                    `id` int(11) NOT NULL AUTO_INCREMENT,
+                    `userId` int(255) DEFAULT NULL,
+                    `url` text,
+                    `name` varchar(255) DEFAULT NULL,
+                    `colorClass` varchar(100) DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_gcallinks_userId` (`userId`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_note` (
+                    `id` int(11) unsigned NOT NULL AUTO_INCREMENT,
+                    `userId` int(11) DEFAULT NULL,
+                    `title` varchar(255) DEFAULT NULL,
+                    `description` text,
+                    PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_projects` (
+                    `id` int(11) NOT NULL AUTO_INCREMENT,
+                    `name` varchar(100) DEFAULT NULL,
+                    `clientId` int(100) DEFAULT NULL,
+                    `details` text,
+                    `state` int(2) DEFAULT NULL,
+                    `hourBudget` varchar(255) NOT NULL,
+                    `dollarBudget` int(11) DEFAULT NULL,
+                    `active` int(11) DEFAULT NULL,
+                    `menuType` MEDIUMTEXT DEFAULT NULL,
+                    `psettings` MEDIUMTEXT NULL,
+                    `parent` INT(11) NULL,
+                    `type` VARCHAR(45) NULL,
+                    `start` DATETIME NULL,
+                    `end` DATETIME NULL,
+                    `created` DATETIME NULL,
+                    `modified` DATETIME NULL,
+                    `avatar` MEDIUMTEXT NULL ,
+                    `cover` MEDIUMTEXT NULL,
+                    `sortIndex` INT(11) NULL,
+                    PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_punch_clock` (
+                    `id` int(11) unsigned NOT NULL AUTO_INCREMENT,
+                    `userId` int(11) NOT NULL,
+                    `minutes` int(11) DEFAULT NULL,
+                    `hours` int(11) DEFAULT NULL,
+                    `punchIn` int(11) DEFAULT NULL,
+                    PRIMARY KEY (`id`,`userId`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_read` (
+                    `id` int(11) unsigned NOT NULL AUTO_INCREMENT,
+                    `module` enum('ticket','message') DEFAULT NULL,
+                    `moduleId` int(11) DEFAULT NULL,
+                    `userId` int(11) DEFAULT NULL,
+                    PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_relationuserproject` (
+                    `id` int(11) NOT NULL AUTO_INCREMENT,
+                    `userId` int(11) DEFAULT NULL,
+                    `projectId` int(11) DEFAULT NULL,
+                    `wage` int(11) DEFAULT NULL,
+                    `projectRole` varchar(20),
+                    PRIMARY KEY (`id`),
+                    KEY zp_relationuserproject_projectId_index (`projectId`),
+                    KEY zp_relationuserproject_userId_index  (`userId`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_tickethistory` (
+                    `id` int(11) unsigned NOT NULL AUTO_INCREMENT,
+                    `userId` int(11) DEFAULT NULL,
+                    `ticketId` int(11) DEFAULT NULL,
+                    `changeType` varchar(255) DEFAULT NULL,
+                    `changeValue` varchar(150) DEFAULT NULL,
+                    `dateModified` datetime DEFAULT NULL,
+                    PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_tickets` (
+                    `id` int(11) NOT NULL AUTO_INCREMENT,
+                    `projectId` int(11) DEFAULT NULL,
+                    `headline` varchar(255) DEFAULT NULL,
+                    `description` text,
+                    `acceptanceCriteria` text,
+                    `date` datetime DEFAULT NULL,
+                    `dateToFinish` datetime DEFAULT NULL,
+                    `priority` varchar(60) DEFAULT NULL,
+                    `status` int(2) DEFAULT NULL,
+                    `userId` int(11) DEFAULT NULL,
+                    `os` varchar(30) DEFAULT NULL,
+                    `browser` varchar(30) DEFAULT NULL,
+                    `resolution` varchar(30) DEFAULT NULL,
+                    `component` varchar(100) DEFAULT NULL,
+                    `version` varchar(20) DEFAULT NULL,
+                    `url` varchar(100) DEFAULT NULL,
+                    `dependingTicketId` int(100) DEFAULT NULL,
+                    `editFrom` datetime DEFAULT NULL,
+                    `editTo` datetime DEFAULT NULL,
+                    `editorId` varchar(75) DEFAULT NULL,
+                    `planHours` float DEFAULT NULL,
+                    `hourRemaining` float DEFAULT NULL,
+                    `type` varchar(255) DEFAULT NULL,
+                    `production` int(1) DEFAULT '0',
+                    `staging` int(1) DEFAULT '0',
+                    `storypoints` float DEFAULT NULL,
+                    `sprint` int(100) DEFAULT NULL,
+                    `sortindex` bigint(20) DEFAULT NULL,
+                    `kanbanSortIndex` bigint(20) DEFAULT NULL,
+                    `tags` varchar(255) DEFAULT NULL,
+                    `milestoneid` INT NULL,
+                    `leancanvasitemid` INT NULL,
+                    `retrospectiveid` INT NULL,
+                    `ideaid` INT NULL,
+                    `zp_ticketscol` VARCHAR(45) NULL,
+                    `modified` datetime DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `ProjectUserId` (`projectId`,`userId`),
+                    KEY `StatusSprint` (`status`,`sprint`),
+                    KEY `Sorting` (`sortindex`),
+                    KEY `idx_tickets_editorId` (`editorId`),
+                    KEY `idx_tickets_milestoneid` (`milestoneid`),
+                    KEY `idx_tickets_editFrom` (`editFrom`),
+                    KEY `idx_tickets_editTo` (`editTo`),
+                    KEY `idx_tickets_dateToFinish` (`dateToFinish`),
+                    KEY `idx_tickets_modified` (`modified`),
+                    KEY `idx_tickets_projectId_status` (`projectId`, `status`),
+                    KEY `idx_tickets_projectId_type` (`projectId`, `type`),
+                    KEY `idx_tickets_status_type` (`status`, `type`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_timesheets` (
+                    `id` int(255) NOT NULL AUTO_INCREMENT,
+                    `userId` int(11) DEFAULT NULL,
+                    `ticketId` int(11) DEFAULT NULL,
+                    `workDate` datetime DEFAULT NULL,
+                    `hours` float DEFAULT NULL,
+                    `description` text,
+                    `kind` varchar(175) DEFAULT NULL,
+                    `invoicedEmpl` int(2) DEFAULT NULL,
+                    `invoicedComp` int(2) DEFAULT NULL,
+                    `invoicedEmplDate` datetime DEFAULT NULL,
+                    `invoicedCompDate` datetime DEFAULT NULL,
+                    `rate` varchar(255) DEFAULT NULL,
+                    `paid` int(2) DEFAULT NULL,
+                    `paidDate` datetime DEFAULT NULL,
+                    `modified` datetime DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `Unique` (`userId`,`ticketId`,`workDate`,`kind`),
+                    KEY `idx_timesheets_ticketId` (`ticketId`),
+                    KEY `idx_timesheets_userId_workDate` (`userId`, `workDate`),
+                    KEY `idx_timesheets_ticketId_workDate` (`ticketId`, `workDate`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_user` (
+                    `id` int(11) NOT NULL AUTO_INCREMENT,
+                    `username` varchar(175) NOT NULL,
+                    `password` varchar(255) NOT NULL DEFAULT '',
+                    `firstname` varchar(100) NOT NULL,
+                    `lastname` varchar(100) NOT NULL,
+                    `phone` varchar(25) NOT NULL,
+                    `profileId` varchar(100) NOT NULL DEFAULT '',
+                    `lastlogin` datetime DEFAULT NULL,
+                    `status` varchar(1) NOT NULL DEFAULT 'A',
+                    `expires` DATETIME DEFAULT NULL,
+                    `role` varchar(200) NOT NULL,
+                    `session` varchar(100) DEFAULT NULL,
+                    `sessiontime` varchar(50) DEFAULT NULL,
+                    `wage` int(11) DEFAULT NULL,
+                    `hours` int(11) DEFAULT NULL,
+                    `description` text,
+                    `clientId` int(11) DEFAULT NULL,
+                    `notifications` int(2) DEFAULT NULL,
+                    `pwReset` varchar(100) DEFAULT NULL,
+                    `pwResetExpiration` datetime DEFAULT NULL,
+                    `pwResetCount` INT(5) DEFAULT NULL,
+                    `forcePwReset` TINYINT DEFAULT NULL,
+                    `lastpwd_change` DATETIME DEFAULT NULL,
+                    `settings` TEXT NULL,
+                    `twoFAEnabled` tinyint(1) DEFAULT '0',
+                    `twoFASecret` varchar(200) DEFAULT NULL,
+                    `createdOn` DATETIME DEFAULT NULL,
+                    `source` varchar(200) DEFAULT NULL,
+                    `jobTitle` VARCHAR(200) NULL,
+                    `jobLevel` VARCHAR(50) NULL,
+                    `department` VARCHAR(200) NULL,
+                    `modified` DATETIME DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `username` (`username`),
+                    KEY `idx_user_clientId` (`clientId`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                INSERT INTO `zp_user`(`id`,`username`,`firstname`,`lastname`,`phone`,`profileId`,`lastlogin`,`lastpwd_change`,`status`,`expires`,`role`,`session`,`sessiontime`,`wage`,`hours`,`description`,`clientId`, `notifications`, `createdOn`, `pwReset`)
+                VALUES (1,:email,:firstname,:lastname,'','',NULL,0,'i',NULL,'50','','',0,0,NULL,0,1, :createdOn, :pwReset);
+
+                CREATE TABLE `zp_sprints` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `projectId` INT NULL,
+                    `name` VARCHAR(45) NULL,
+                    `startDate` DATETIME NULL,
+                    `endDate` DATETIME NULL,
+                    `modified` datetime DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `idx_sprints_projectId_startDate_endDate` (`projectId`, `startDate`, `endDate`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_stats` (
+                    `sprintId` INT NULL,
+                    `projectId` INT NULL,
+                    `date` DATETIME NULL,
+                    `sum_todos` INT NULL,
+                    `sum_open_todos` INT NULL,
+                    `sum_progres_todos` INT NULL,
+                    `sum_closed_todos` INT NULL,
+                    `sum_planned_hours` FLOAT NULL,
+                    `sum_estremaining_hours` FLOAT NULL,
+                    `sum_logged_hours` FLOAT NULL,
+                    `sum_points` INT NULL,
+                    `sum_points_done` INT NULL,
+                    `sum_points_progress` INT NULL,
+                    `sum_points_open` INT NULL,
+                    `sum_todos_xs` INT NULL,
+                    `sum_todos_s` INT NULL,
+                    `sum_todos_m` INT NULL,
+                    `sum_todos_l` INT NULL,
+                    `sum_todos_xl` INT NULL,
+                    `sum_todos_xxl` INT NULL,
+                    `sum_todos_none` INT NULL,
+                    `tickets` TEXT NULL,
+                    `daily_avg_hours_booked_todo` FLOAT NULL,
+                    `daily_avg_hours_booked_point` FLOAT NULL,
+                    `daily_avg_hours_planned_todo` FLOAT NULL,
+                    `daily_avg_hours_planned_point` FLOAT NULL,
+                    `daily_avg_hours_remaining_point` FLOAT NULL,
+                    `daily_avg_hours_remaining_todo` FLOAT NULL,
+                    `sum_teammembers` INT NULL,
+                    INDEX `projectId` (`projectId` ASC, `sprintId` ASC),
+                    KEY `idx_stats_projectId_sprintId_date` (`projectId`, `sprintId`, `date`),
+                    KEY `idx_stats_sprintId_date` (`sprintId`, `date`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_settings` (
+                    `key` VARCHAR(175) NOT NULL,
+                    `value` MEDIUMTEXT NULL,
+                    PRIMARY KEY (`key`),
+                    KEY `idx_settings_key` (`key`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                INSERT INTO zp_settings (`key`, `value`) VALUES ('db-version', :dbVersion);
+                INSERT INTO zp_settings (`key`, `value`) VALUES ('companysettings.telemetry.active', 'true');
+
+                CREATE TABLE `zp_audit` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `userId` INT NULL,
+                    `projectId` INT NULL,
+                    `action` VARCHAR(45) NULL,
+                    `entity` VARCHAR(45) NULL,
+                    `entityId` INT NULL,
+                    `values` TEXT NULL,
+                    `date` DATETIME NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `projectId` (`projectId` ASC),
+                    KEY `projectAction` (`projectId` ASC, `action` ASC),
+                    KEY `projectEntityEntityId` (`projectId` ASC, `entity` ASC, `entityId` ASC)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_queue` (
+                    `msghash` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `channel` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+                    `userId` int(11) NOT NULL,
+                    `subject` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+                    `message` text COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `thedate` datetime NOT NULL,
+                    `projectId` int(11) NOT NULL,
+                    PRIMARY KEY (`msghash`),
+                    KEY `projectId` (`projectId`),
+                    KEY `userId` (`userId`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_plugins` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `name` VARCHAR(45) NULL,
+                    `enabled` TINYINT NULL,
+                    `description` VARCHAR(255) NULL,
+                    `version` VARCHAR(45) NULL,
+                    `installdate` DATETIME NULL,
+                    `foldername` VARCHAR(45),
+                    `homepage` VARCHAR(255) NULL,
+                    `authors` VARCHAR(255) NULL,
+                    `license` TEXT NULL DEFAULT NULL,
+                    `format` VARCHAR(45) NULL DEFAULT NULL,
+                    PRIMARY KEY (`id`)
+                  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_notifications` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `userId` INT NOT NULL,
+                    `read` INT NULL,
+                    `type` VARCHAR(45) NULL,
+                    `module` VARCHAR(45) NULL,
+                    `moduleId` INT NULL,
+                    `datetime` DATETIME NULL,
+                    `url` VARCHAR(255) NULL,
+                    `authorId` INT NULL,
+                    `message` TEXT NULL,
+                    PRIMARY KEY (`id`),
+                    INDEX `userId` (`userId` ASC),
+                    INDEX `userId,datetime` (`userId` ASC, `datetime` DESC),
+                    INDEX `userId,read` (`userId` ASC, `read` DESC)
+                  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_entity_relationship` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `entityA` INT NULL,
+                    `entityAType` VARCHAR(45) NULL,
+                    `entityB` INT NULL,
+                    `entityBType` VARCHAR(45) NULL,
+                    `relationship` VARCHAR(45) NULL,
+                    `createdOn` DATETIME NULL,
+                    `createdBy` INT NULL,
+                    `meta` TEXT NULL,
+                    PRIMARY KEY (`id`),
+                    INDEX `entityA` (`entityA` ASC, `entityAType` ASC, `relationship` ASC),
+                    INDEX `entityB` (`entityB` ASC, `entityBType` ASC, `relationship` ASC)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_integration` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `providerId` VARCHAR(45) NULL,
+                    `method` VARCHAR(45) NULL,
+                    `entity` VARCHAR(45) NULL,
+                    `fields` TEXT NULL,
+                    `schedule` VARCHAR(45) NULL,
+                    `notes` VARCHAR(45) NULL,
+                    `auth` TEXT NULL,
+                    `meta` VARCHAR(45) NULL,
+                    `createdOn` DATETIME NULL,
+                    `createdBy` INT NULL,
+                    `lastSync` VARCHAR(45) NULL,
+                    PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_reactions` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `userId` INT NULL,
+                    `moduleId` INT NULL,
+                    `module` VARCHAR(45) NULL,
+                    `reaction` VARCHAR(45) NULL,
+                    `date` DATETIME NULL,
+                    PRIMARY KEY (`id`),
+                    INDEX `entity` (`moduleId` ASC, `module` ASC, `reaction` ASC),
+                    INDEX `user` (`userId` ASC, `moduleId` ASC, `module` ASC, `reaction` ASC)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_access_tokens` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `tokenable_type` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `tokenable_id` bigint unsigned NOT NULL,
+                    `name` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `token` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `abilities` text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+                    `last_used_at` timestamp NULL DEFAULT NULL,
+                    `expires_at` timestamp NULL DEFAULT NULL,
+                    `created_at` timestamp NULL DEFAULT NULL,
+                    `updated_at` timestamp NULL DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `personal_access_tokens_token_unique` (`token`),
+                    KEY `personal_access_tokens_tokenable_type_tokenable_id_index` (`tokenable_type`,`tokenable_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE `zp_jobs` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `queue` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `payload` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `attempts` tinyint unsigned NOT NULL,
+                    `reserved_at` int unsigned DEFAULT NULL,
+                    `available_at` int unsigned NOT NULL,
+                    `created_at` int unsigned NOT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `zp_jobs_queue_index` (`queue`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+                CREATE TABLE IF NOT EXISTS `zp_recurring_patterns` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `entityId` INT NOT NULL,
+                    `module` VARCHAR(50) NOT NULL,
+                    `type` VARCHAR(50) NOT NULL,
+                    `trigger` VARCHAR(50) NOT NULL,
+                    `interval` INT NOT NULL DEFAULT 1,
+                    `weekDays` TEXT NULL,
+                    `monthDay` INT NULL,
+                    `months` TEXT NULL,
+                    `action` VARCHAR(20) NOT NULL DEFAULT 'reset',
+                    `lastProcessed` DATETIME NULL,
+                    `nextProcessingDate` DATETIME NULL,
+                    `enabled` TINYINT(1) NOT NULL DEFAULT 1,
+                    PRIMARY KEY (`id`),
+                    INDEX `entityId` (`entityId`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+            ";
+
+        return $sql;
+    }
+
+    /**
+     * update_sql_20004 - database update sql for V2.0.4
+     * - Updates all tables and db to utf8mb4
+     * - converts 255 index to be smaller
+     *
+     * @noinspection SqlResolve - A lot of tables don't exist anymore, so this will not resolve. Keeping the update script for backwards compatibility
+     */
+    private function update_sql_20004(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_wiki_articles` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_submodulerights` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_canvas` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_wiki_categories` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_tickethistory` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_gcallinks` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_message` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_note` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_timesheets` MODIFY kind VARCHAR(175);',
+            'ALTER TABLE `zp_timesheets` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_roles` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_projects` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_modulerights` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_wiki_comments` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_punch_clock` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_clients` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_account` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_sprints` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_lead` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_user` MODIFY username VARCHAR(175);',
+            'ALTER TABLE `zp_user` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_settings` MODIFY `key` VARCHAR(175);',
+            'ALTER TABLE `zp_settings` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_comment` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_stats` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_tickets` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_canvas_items` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_dashboard_widgets` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_file` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_action_tabs` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_relationuserproject` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_calendar` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_read` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_wiki` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20100(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'UPDATE `zp_user` SET role = 50 WHERE role = 2;',
+            'UPDATE `zp_user` SET role = 10 WHERE role = 3;',
+            'UPDATE `zp_user` SET role = 20 WHERE role = 4;',
+            'UPDATE `zp_user` SET role = 40 WHERE role = 5;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20101(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_comment` CHANGE COLUMN `module` `module` VARCHAR(200) NULL DEFAULT NULL ;',
+            'ALTER TABLE `zp_stats`
+                    ADD COLUMN `sum_teammembers` INT(11) NULL DEFAULT NULL AFTER `daily_avg_hours_remaining_todo`,
+                    CHANGE COLUMN `sum_planned_hours` `sum_planned_hours` FLOAT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `sum_logged_hours` `sum_logged_hours` FLOAT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `sum_estremaining_hours` `sum_estremaining_hours` FLOAT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `daily_avg_hours_booked_todo` `daily_avg_hours_booked_todo` FLOAT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `daily_avg_hours_booked_point` `daily_avg_hours_booked_point` FLOAT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `daily_avg_hours_planned_todo` `daily_avg_hours_planned_todo` FLOAT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `daily_avg_hours_planned_point` `daily_avg_hours_planned_point` FLOAT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `daily_avg_hours_remaining_point` `daily_avg_hours_remaining_point` FLOAT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `daily_avg_hours_remaining_todo` `daily_avg_hours_remaining_todo` FLOAT NULL DEFAULT NULL ;',
+            'CREATE TABLE `zp_audit` (
+                      `id` INT NOT NULL AUTO_INCREMENT,
+                      `userId` INT NULL,
+                      `projectId` INT NULL,
+                      `action` VARCHAR(45) NULL,
+                      `entity` VARCHAR(45) NULL,
+                      `entityId` INT NULL,
+                      `values` TEXT NULL,
+                      `date` DATETIME NULL,
+                      PRIMARY KEY (`id`),
+                      KEY `projectId` (`projectId` ASC),
+                      KEY `projectAction` (`projectId` ASC, `action` ASC),
+                      KEY `projectEntityEntityId` (`projectId` ASC, `entity` ASC, `entityId` ASC)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20102(): bool|array
+    {
+        $errors = [];
+
+        $sql = [
+            "ALTER TABLE `zp_user` add COLUMN `twoFAEnabled` tinyint(1) DEFAULT '0'",
+            'ALTER TABLE `zp_user` add COLUMN `twoFASecret` varchar(200) DEFAULT NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20103(): bool|array
+    {
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_tickets` CHANGE COLUMN `planHours` `planHours` FLOAT NULL DEFAULT NULL',
+            'ALTER TABLE `zp_tickets` CHANGE COLUMN `hourRemaining` `hourRemaining` FLOAT NULL DEFAULT NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20104(): bool|array
+    {
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_user` ADD COLUMN `pwResetCount` INT(5) NULL AFTER `pwResetExpiration`',
+            'ALTER TABLE `zp_user` ADD COLUMN `forcePwReset` TINYINT NULL AFTER `pwResetCount`',
+            'ALTER TABLE `zp_user` ADD COLUMN `createdOn` DATETIME NULL AFTER `twoFASecret`',
+            'ALTER TABLE `zp_user` CHANGE COLUMN `lastpwd_change` `lastpwd_change` DATETIME NULL DEFAULT NULL AFTER `forcePwReset`',
+            'ALTER TABLE `zp_user` CHANGE COLUMN `expires` `expires` DATETIME NULL DEFAULT NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20105(): bool|array
+    {
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_projects` ADD COLUMN `psettings` MEDIUMTEXT NULL AFTER `active`',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20106(): bool|array
+    {
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_user` ADD COLUMN `source` varchar(200) DEFAULT NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20107(): bool|array
+    {
+        $errors = [];
+
+        $sql = [
+            "INSERT INTO zp_settings (`key`, `value`) VALUES ('companysettings.telemetry.active', 'true')",
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20108(): bool|array
+    {
+        $errors = [];
+
+        $sql = [
+            'alter table zp_relationuserproject add `projectRole` varchar(20) null',
+            'create index zp_relationuserproject_projectId_index on zp_relationuserproject (projectId)',
+            'create index zp_relationuserproject_userId_index on zp_relationuserproject (userId)',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20109(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'CREATE TABLE IF NOT EXISTS `zp_queue` (
+                               `msghash` varchar(50) NOT NULL,
+                                `channel` varchar(255),
+                               `userId` int(11) NOT NULL,
+                                `subject` varchar(255),
+                               `message` text NOT NULL,
+                               `thedate` datetime NOT NULL,
+                               `projectId` int(11) NOT NULL,
+                               PRIMARY KEY (`msghash`),
+                               KEY `projectId` (`projectId`),
+                               KEY `userId` (`userId`)
+			   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    private function update_sql_20110(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'alter table zp_canvas_items add tags text null',
+            'alter table zp_canvas_items add title varchar(255) null',
+            'alter table zp_canvas_items add parent int null',
+            'alter table zp_canvas_items add featured int null',
+            'create table zp_approvals
+                (
+                    id               int auto_increment,
+                    module           varchar(100) null,
+                    entityId         int          null,
+                    requestorId      int          null,
+                    approverId       int          null,
+                    approvalStatus   int          null,
+                    requestedOn      datetime     null,
+                    lastStatusChange datetime     null,
+                    constraint zp_approvals_pk
+                        primary key (id)
+                )',
+            'alter table zp_comment add status varchar(50) null',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    /*         * *
+     * update_sql_20111 - Update database for new Canvas
+     *
+     * @access private
+     * @return bool|array    Success of database update or array of errors
+     */
+
+    private function update_sql_20111(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE zp_projects ADD menuType MEDIUMTEXT null',
+            "UPDATE zp_projects SET menuType = '".MenuRepository::DEFAULT_MENU."'",
+            'ALTER TABLE zp_canvas_items ADD relates VARCHAR(255) null',
+            'UPDATE zp_canvas_items INNER JOIN zp_canvas ON zp_canvas.id = zp_canvas_items.id '.
+            "SET zp_canvas_items.status = 'draft' WHERE zp_canvas_items.status = 'danger' AND zp_canvas.type = 'leancanvas'",
+            'UPDATE zp_canvas_items INNER JOIN zp_canvas ON zp_canvas.id = zp_canvas_items.id '.
+            "SET zp_canvas_items.status = 'valid' WHERE zp_canvas_items.status = 'sucess' AND zp_canvas.type = 'leancanvas'",
+            'UPDATE zp_canvas_items INNER JOIN zp_canvas ON zp_canvas.id = zp_canvas_items.id '.
+            "SET zp_canvas_items.status = 'invalid' WHERE zp_canvas_items.status = 'info' AND zp_canvas.type = 'leancanvas'",
+            "UPDATE zp_canvas SET zp_canvas.type = 'retroscanvas' WHERE zp_canvas.type = 'retrospective'",
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    /*         * *
+     * update_sql_20112 - Update database for new Canvas
+     *
+     * @access private
+     * @return bool|array    Success of database update or array of errors
+     */
+
+    private function update_sql_20112(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'CREATE TABLE `zp_plugins` (
+                  `id` INT NOT NULL AUTO_INCREMENT,
+                  `name` VARCHAR(45) NULL,
+                  `enabled` TINYINT NULL,
+                  `description` VARCHAR(255) NULL,
+                  `version` VARCHAR(45) NULL,
+                  `installdate` DATETIME NULL,
+                  `foldername` VARCHAR(45) NULL,
+                  `homepage` VARCHAR(255) NULL,
+                  `authors` VARCHAR(255) NULL,
+                  PRIMARY KEY (`id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;',
+            'ALTER TABLE `zp_timesheets` ADD COLUMN `paid` SMALLINT NULL AFTER `rate`, ADD COLUMN `paidDate` DATETIME NULL AFTER `paid`;',
+            'DROP TABLE IF EXISTS zp_account, zp_action_tabs, zp_dashboard_widgets, zp_lead, zp_message, zp_modulerights, zp_roles, zp_submodulerights, zp_wiki, zp_wiki_articles, zp_wiki_categories, zp_wiki_comments;',
+            'CREATE TABLE `zp_notifications` (
+                  `id` INT NOT NULL AUTO_INCREMENT,
+                  `userId` INT NOT NULL,
+                  `read` INT NULL,
+                  `type` VARCHAR(45) NULL,
+                  `module` VARCHAR(45) NULL,
+                  `moduleId` INT NULL,
+                  `datetime` DATETIME NULL,
+                  `url` VARCHAR(255) NULL,
+                  `authorId` INT NULL,
+                  `message` TEXT NULL,
+                  PRIMARY KEY (`id`),
+                  INDEX `userId` (`userId` ASC),
+                  INDEX `userId,datetime` (`userId` ASC, `datetime` DESC),
+                  INDEX `userId,read` (`userId` ASC, `read` DESC)
+                  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    /* * *
+     * update_sql_20113 - Create onboarding setting for first time installs
+     *
+     * @access private
+     * @return bool|array    Success of database update or array of errors
+     */
+
+    private function update_sql_20113(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            "INSERT INTO zp_settings (`key`, `value`) VALUES ('companysettings.completedOnboarding', 'true') ON DUPLICATE KEY UPDATE `value` = 'true'",
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20114(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_projects`
+                ADD COLUMN `type` VARCHAR(45) NULL,
+                ADD COLUMN `start` DATETIME NULL,
+                ADD COLUMN `end` DATETIME NULL,
+                ADD COLUMN `created` DATETIME NULL,
+                ADD COLUMN `modified` DATETIME NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20115(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            ' CREATE TABLE `zp_entity_relationships` (
+                        `id` INT NOT NULL AUTO_INCREMENT,
+                        `enitityA` INT NULL,
+                        `entityAType` VARCHAR(45) NULL,
+                        `entityB` INT NULL,
+                        `entityBType` VARCHAR(45) NULL,
+                        `relationship` VARCHAR(45) NULL,
+                        `createdOn` DATETIME NULL,
+                        `createdBy` INT NULL,
+                        `meta` TEXT NULL,
+                        PRIMARY KEY (`id`),
+                        INDEX `entityA` (`enitityA` ASC, `entityAType` ASC, `relationship` ASC),
+                        INDEX `entityB` (`entityB` ASC, `entityBType` ASC, `relationship` ASC)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
+            "UPDATE `zp_tickets` SET milestoneid = dependingTicketId , dependingTicketId = '' WHERE type <> 'subtask' AND dependingTicketId > 0",
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20116(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            ' CREATE TABLE `zp_reactions` (
+                      `id` INT NOT NULL AUTO_INCREMENT,
+                      `userId` INT NULL,
+                      `moduleId` INT NULL,
+                      `module` VARCHAR(45) NULL,
+                      `reaction` VARCHAR(45) NULL,
+                      `date` DATETIME NULL,
+                      PRIMARY KEY (`id`),
+                      INDEX `entity` (`moduleId` ASC, `module` ASC, `reaction` ASC),
+                      INDEX `user` (`userId` ASC, `moduleId` ASC, `module` ASC, `reaction` ASC)
+                      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
+            'ALTER TABLE `zp_projects`
+                ADD COLUMN `avatar` MEDIUMTEXT NULL AFTER `modified`,
+                ADD COLUMN `cover` MEDIUMTEXT NULL AFTER `avatar`;',
+
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20117(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_projects`
+                ADD COLUMN `parent` INT(11) NULL;',
+
+            'ALTER TABLE `zp_projects`
+                ADD COLUMN `sortIndex` INT(11) NULL;',
+
+            'ALTER TABLE `zp_user`
+                ADD COLUMN `jobTitle` VARCHAR(200) NULL ,
+                ADD COLUMN `jobLevel` VARCHAR(50) NULL ,
+                ADD COLUMN `department` VARCHAR(200) NULL ;',
+
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20118(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+
+            'UPDATE `zp_projects` SET parent = null;',
+
+            'UPDATE `zp_projects` SET start = null, end = null;',
+
+            'ALTER TABLE `zp_projects`
+                CHANGE COLUMN `parent` `parent` INT(11) NULL DEFAULT NULL,
+                CHANGE COLUMN `type` `type` VARCHAR(45) NULL DEFAULT NULL ;',
+
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20120(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+
+            'ALTER TABLE `zp_canvas_items`
+                ADD COLUMN `kpi` INT NULL DEFAULT NULL AFTER `tags`,
+                ADD COLUMN `data1` TEXT NULL DEFAULT NULL AFTER `kpi`,
+                ADD COLUMN `data2` TEXT NULL DEFAULT NULL AFTER `data1`,
+                ADD COLUMN `data3` TEXT NULL DEFAULT NULL AFTER `data2`,
+                ADD COLUMN `data4` TEXT NULL DEFAULT NULL AFTER `data3`,
+                ADD COLUMN `data5` TEXT NULL DEFAULT NULL AFTER `data4`,
+                ADD COLUMN `startDate` DATETIME NULL DEFAULT NULL AFTER `data5`,
+                ADD COLUMN `endDate` DATETIME NULL DEFAULT NULL AFTER `startDate`,
+                ADD COLUMN `setting` TEXT NULL DEFAULT NULL AFTER `endDate`,
+                ADD COLUMN `metricType` VARCHAR(45) NULL DEFAULT NULL AFTER `setting`,
+                ADD COLUMN `startValue` double(10,2) NULL DEFAULT NULL AFTER `metricType`,
+                ADD COLUMN `currentValue` double(10,2) NULL DEFAULT NULL AFTER `startValue`,
+                ADD COLUMN `endValue` double(10,2) NULL DEFAULT NULL AFTER `currentValue`,
+                ADD COLUMN `impact` INT NULL DEFAULT NULL AFTER `endValue`,
+                ADD COLUMN `effort` INT NULL DEFAULT NULL AFTER `impact`,
+                ADD COLUMN `probability` INT NULL DEFAULT NULL AFTER `effort`,
+                ADD COLUMN `action` TEXT NULL DEFAULT NULL AFTER `probability`,
+                ADD COLUMN `assignedTo` INT NULL DEFAULT NULL AFTER `action`;',
+            "UPDATE zp_canvas_items SET
+                    currentValue = CAST(CASE WHEN `data` = '' THEN 0 ELSE `data` END AS DECIMAL(10,2)),
+                    endValue = CAST(CASE WHEN `conclusion` = '' THEN 0 ELSE `conclusion` END AS DECIMAL(10,2)),
+                    title = description,
+                    description = assumptions
+                    WHERE box = 'goal';",
+            'ALTER TABLE `zp_canvas_items`
+                ADD INDEX `CanvasLookUp` (`canvasId` ASC, `box` ASC);',
+
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20121(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_canvas`
+                    ADD COLUMN `description` TEXT NULL DEFAULT NULL AFTER `type`;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20122(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_settings`
+                    CHANGE COLUMN `value` `value` MEDIUMTEXT NULL DEFAULT NULL ;',
+            'ALTER TABLE `zp_canvas_items`
+                    CHANGE COLUMN `description` `description` MEDIUMTEXT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `data` `data` MEDIUMTEXT NULL DEFAULT NULL;',
+            'ALTER TABLE `zp_user`
+                    ADD COLUMN `modified` DATETIME NULL DEFAULT NULL;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20401(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_plugins`
+                ADD COLUMN `license` TEXT NULL DEFAULT NULL,
+                ADD COLUMN `format` VARCHAR(45) NULL DEFAULT NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20402(): bool|array
+    {
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_plugins`
+                ADD COLUMN `format` VARCHAR(45) NULL DEFAULT NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                $errors[] = "$statement Failed: {$e->getMessage()}";
+            }
+        }
+
+        return count($errors) ? $errors : true;
+    }
+
+    /**
+     * Install script did not include medium text updates. Run again
+     */
+    public function update_sql_20405(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_settings`
+                    CHANGE COLUMN `value` `value` MEDIUMTEXT NULL DEFAULT NULL ;',
+            'ALTER TABLE `zp_canvas_items`
+                    CHANGE COLUMN `description` `description` MEDIUMTEXT NULL DEFAULT NULL ,
+                    CHANGE COLUMN `data` `data` MEDIUMTEXT NULL DEFAULT NULL;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    /**
+     * Install script did not include medium text updates. Run again
+     */
+    public function update_sql_20406(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_canvas_items`
+                    CHANGE COLUMN `data1` `data1` MEDIUMTEXT NULL DEFAULT NULL,
+                    CHANGE COLUMN `data2` `data2` MEDIUMTEXT NULL DEFAULT NULL,
+                    CHANGE COLUMN `data3` `data3` MEDIUMTEXT NULL DEFAULT NULL,
+                    CHANGE COLUMN `data4` `data4` MEDIUMTEXT NULL DEFAULT NULL,
+                    CHANGE COLUMN `data5` `data5` MEDIUMTEXT NULL DEFAULT NULL;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_20407(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'CREATE TABLE IF NOT EXISTS `zp_integration` (
+                      `id` INT NOT NULL AUTO_INCREMENT,
+                      `providerId` VARCHAR(45) NULL,
+                      `method` VARCHAR(45) NULL,
+                      `entity` VARCHAR(45) NULL,
+                      `fields` TEXT NULL,
+                      `schedule` VARCHAR(45) NULL,
+                      `notes` VARCHAR(45) NULL,
+                      `auth` TEXT NULL,
+                      `meta` VARCHAR(45) NULL,
+                      `createdOn` DATETIME NULL,
+                      `createdBy` INT NULL,
+                      PRIMARY KEY (`id`)
+                      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
+            'ALTER TABLE `zp_integration`
+                    ADD COLUMN `lastSync` DATETIME NULL DEFAULT NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                array_push($errors, $statement.' Failed:'.$e->getMessage());
+            }
+        }
+
+        if (count($errors) > 0) {
+            return $errors;
+        } else {
+            return true;
+        }
+    }
+
+    public function update_sql_30002(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_plugins` ADD COLUMN `license` TEXT NULL DEFAULT NULL',
+            'ALTER TABLE `zp_plugins` ADD COLUMN `format` VARCHAR(45) NULL DEFAULT NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+            }
+        }
+
+        return true;
+    }
+
+    public function update_sql_30003(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'ALTER TABLE `zp_canvas` ADD COLUMN `modified` datetime NULL DEFAULT NULL',
+            'ALTER TABLE `zp_clients` ADD COLUMN `modified` datetime NULL DEFAULT NULL',
+            'ALTER TABLE `zp_sprints` ADD COLUMN `modified` datetime NULL DEFAULT NULL',
+            'ALTER TABLE `zp_projects` ADD COLUMN `modified` datetime NULL DEFAULT NULL',
+            'ALTER TABLE `zp_timesheets` ADD COLUMN `modified` datetime NULL DEFAULT NULL',
+            'ALTER TABLE `zp_tickets` ADD COLUMN `modified` datetime NULL DEFAULT NULL',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+            }
+        }
+
+        return true;
+    }
+
+    public function update_sql_30400(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'CREATE TABLE `zp_access_tokens` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `tokenable_type` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `tokenable_id` bigint unsigned NOT NULL,
+                    `name` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `token` varchar(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `abilities` text CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,
+                    `last_used_at` timestamp NULL DEFAULT NULL,
+                    `expires_at` timestamp NULL DEFAULT NULL,
+                    `created_at` timestamp NULL DEFAULT NULL,
+                    `updated_at` timestamp NULL DEFAULT NULL,
+                    PRIMARY KEY (`id`),
+                    UNIQUE KEY `personal_access_tokens_token_unique` (`token`),
+                    KEY `personal_access_tokens_tokenable_type_tokenable_id_index` (`tokenable_type`,`tokenable_id`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;',
+            'CREATE TABLE `zp_jobs` (
+                    `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+                    `queue` varchar(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `payload` longtext CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL,
+                    `attempts` tinyint unsigned NOT NULL,
+                    `reserved_at` int unsigned DEFAULT NULL,
+                    `available_at` int unsigned NOT NULL,
+                    `created_at` int unsigned NOT NULL,
+                    PRIMARY KEY (`id`),
+                    KEY `zp_jobs_queue_index` (`queue`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;',
+            'CREATE TABLE IF NOT EXISTS `zp_recurring_patterns` (
+                    `id` INT NOT NULL AUTO_INCREMENT,
+                    `entityId` INT NOT NULL,
+                    `module` VARCHAR(50) NOT NULL,
+                    `type` VARCHAR(50) NOT NULL,
+                    `trigger` VARCHAR(50) NOT NULL,
+                    `interval` INT NOT NULL DEFAULT 1,
+                    `weekDays` TEXT NULL,
+                    `monthDay` INT NULL,
+                    `months` TEXT NULL,
+                    `action` VARCHAR(20) NOT NULL DEFAULT \'reset\',
+                    `lastProcessed` DATETIME NULL,
+                    `nextProcessingDate` DATETIME NULL,
+                    `enabled` TINYINT(1) NOT NULL DEFAULT 1,
+                    PRIMARY KEY (`id`),
+                    INDEX `entityId` (`entityId`)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+            }
+        }
+
+        return true;
+    }
+
+    public function update_sql_30408(): bool|array
+    {
+
+        $errors = [];
+
+        $sql = [
+            'INSERT INTO zp_settings (`key`, `value`)
+                    SELECT
+                        CONCAT("user.", `id`, ".firstLoginComplete") AS `key`,
+                        1 AS `value`
+                    FROM zp_user;',
+
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Database performance optimization - add indexes for frequently used queries
+     */
+    public function update_sql_30409(): bool|array
+    {
+        $errors = [];
+
+        // High Priority Indexes - Critical Performance Impact
+        $sql = [
+            // Individual column indexes for tickets table
+            'CREATE INDEX idx_tickets_editorId ON zp_tickets (editorId)',
+            'CREATE INDEX idx_tickets_milestoneid ON zp_tickets (milestoneid)',
+            'CREATE INDEX idx_tickets_editFrom ON zp_tickets (editFrom)',
+            'CREATE INDEX idx_tickets_editTo ON zp_tickets (editTo)',
+            'CREATE INDEX idx_tickets_dateToFinish ON zp_tickets (dateToFinish)',
+            'CREATE INDEX idx_tickets_modified ON zp_tickets (modified)',
+
+            // Medium Priority - Combined indexes for common filter patterns
+            'CREATE INDEX idx_tickets_projectId_status ON zp_tickets (projectId, status)',
+            'CREATE INDEX idx_tickets_projectId_type ON zp_tickets (projectId, type)',
+
+            // User and project related indexes
+            'CREATE INDEX idx_user_clientId ON zp_user (clientId)',
+            'CREATE INDEX idx_projects_clientId ON zp_projects (clientId)',
+            'CREATE INDEX idx_projects_state ON zp_projects (state)',
+
+            // Timesheets performance
+            'CREATE INDEX idx_timesheets_ticketId ON zp_timesheets (ticketId)',
+
+            // Lower Priority - Additional combinations
+            'CREATE INDEX idx_tickets_status_type ON zp_tickets (status, type)',
+            'CREATE INDEX idx_tickethistory_ticketId_dateModified ON zp_tickethistory (ticketId, dateModified)',
+
+            // Phase 2: Canvas, Comments, Files, Notifications, Calendar, Sprints Performance
+            // Canvas and Canvas Items - High Priority for Ideas, Goals, Wiki
+            'CREATE INDEX idx_canvas_projectId_type ON zp_canvas (projectId, type)',
+            'CREATE INDEX idx_canvas_type_id ON zp_canvas (type, id)',
+            'CREATE INDEX idx_canvas_items_canvasId_box ON zp_canvas_items (canvasId, box)',
+            'CREATE INDEX idx_canvas_items_box_milestoneId ON zp_canvas_items (box, milestoneId)',
+            'CREATE INDEX idx_canvas_items_box_status_author ON zp_canvas_items (box, status, author)',
+            'CREATE INDEX idx_canvas_items_parent_title ON zp_canvas_items (parent, title)',
+
+            // Notifications - High Priority for user interactions
+            'CREATE INDEX idx_notifications_userId_read_datetime ON zp_notifications (userId, `read`, datetime)',
+
+            // Timesheets - Additional High Priority indexes
+            'CREATE INDEX idx_timesheets_userId_workDate ON zp_timesheets (userId, workDate)',
+            'CREATE INDEX idx_timesheets_ticketId_workDate ON zp_timesheets (ticketId, workDate)',
+
+            // Calendar - High Priority for scheduling
+            'CREATE INDEX idx_calendar_userId_dateFrom_dateTo ON zp_calendar (userId, dateFrom, dateTo)',
+            'CREATE INDEX idx_gcallinks_userId ON zp_gcallinks (userId)',
+
+            // Comments - Medium Priority for threaded discussions
+            'CREATE INDEX idx_comment_moduleId_module_commentParent ON zp_comment (moduleId, module, commentParent)',
+            'CREATE INDEX idx_comment_userId_module ON zp_comment (userId, module)',
+
+            // Files - Medium Priority for file access
+            'CREATE INDEX idx_file_module_moduleId_userId ON zp_file (module, moduleId, userId)',
+
+            // Sprints - Medium Priority for project management
+            'CREATE INDEX idx_sprints_projectId_startDate_endDate ON zp_sprints (projectId, startDate, endDate)',
+
+            // Settings - For project configuration lookups
+            'CREATE INDEX idx_settings_key ON zp_settings (`key`)',
+
+            // Stats table for reports (if exists) - Lower Priority
+            'CREATE INDEX idx_stats_projectId_sprintId_date ON zp_stats (projectId, sprintId, date)',
+            'CREATE INDEX idx_stats_sprintId_date ON zp_stats (sprintId, date)',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed:'.$e->getMessage());
+                Log::error($e);
+                // Don't fail the entire migration for duplicate indexes
+                if (! str_contains($e->getMessage(), 'Duplicate key name')) {
+                    array_push($errors, $statement.' Failed:'.$e->getMessage());
+                }
+            }
+        }
+
+        return count($errors) ? $errors : true;
+    }
+
+    /**
+     * Migration 30410: Ensure zp_entity_relationship table exists with correct schema
+     *
+     * This migration must handle all possible database states from different upgrade paths:
+     * - State A: Only plural table (zp_entity_relationships) exists with typo column (enitityA)
+     * - State B: Only singular table (zp_entity_relationship) exists with correct column (entityA)
+     * - State C: Only singular table exists with typo column (enitityA)
+     * - State D: Both tables exist (from failed previous migrations)
+     * - State E: Neither table exists (fresh install edge case)
+     *
+     * @return bool Always returns true to prevent blocking subsequent migrations
+     */
+    public function update_sql_30410(): bool|array
+    {
+        $pluralTable = 'zp_entity_relationships';
+        $singularTable = 'zp_entity_relationship';
+
+        try {
+            $pluralExists = $this->tableExistsForMigration($pluralTable);
+            $singularExists = $this->tableExistsForMigration($singularTable);
+
+            // Case D: Both tables exist - merge data from plural into singular, then drop plural
+            if ($pluralExists && $singularExists) {
+                $this->mergeEntityRelationshipTables($pluralTable, $singularTable);
+            }
+            // Case A: Only plural exists - rename to singular
+            elseif ($pluralExists && ! $singularExists) {
+                $this->connection->statement("RENAME TABLE `{$pluralTable}` TO `{$singularTable}`");
+            }
+            // Case E: Neither exists - create singular with correct schema
+            elseif (! $pluralExists && ! $singularExists) {
+                $this->createEntityRelationshipTable();
+
+                return true;
+            }
+            // Case B/C: Only singular exists - continue to fix column/index if needed
+
+            // Fix column typo if present (handles Case A after rename, Case C, Case D after merge)
+            $this->fixEntityAColumnTypo($singularTable);
+
+            // Ensure correct index exists
+            $this->ensureEntityAIndex($singularTable);
+
+        } catch (\Exception $e) {
+            Log::error('Migration 30410: '.$e->getMessage());
+            // Don't fail the migration - log and continue
+        }
+
+        return true;
+    }
+
+    /**
+     * Check if a table exists in the current database
+     */
+    private function tableExistsForMigration(string $tableName): bool
+    {
+        $result = $this->connection->select(
+            'SELECT COUNT(*) as cnt FROM information_schema.tables
+             WHERE table_schema = DATABASE() AND table_name = ?',
+            [$tableName]
+        );
+
+        return $result[0]->cnt > 0;
+    }
+
+    /**
+     * Check if a column exists in a table
+     */
+    private function columnExistsForMigration(string $tableName, string $columnName): bool
+    {
+        $result = $this->connection->select(
+            'SELECT COUNT(*) as cnt FROM information_schema.columns
+             WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?',
+            [$tableName, $columnName]
+        );
+
+        return $result[0]->cnt > 0;
+    }
+
+    /**
+     * Check if an index exists on a table
+     */
+    private function indexExistsForMigration(string $tableName, string $indexName): bool
+    {
+        $result = $this->connection->select(
+            'SELECT COUNT(*) as cnt FROM information_schema.statistics
+             WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ?',
+            [$tableName, $indexName]
+        );
+
+        return $result[0]->cnt > 0;
+    }
+
+    /**
+     * Merge data from plural table into singular table, then drop plural
+     */
+    private function mergeEntityRelationshipTables(string $sourceTable, string $targetTable): void
+    {
+        try {
+            // Determine column names in source table (may have typo)
+            $sourceHasTypo = $this->columnExistsForMigration($sourceTable, 'enitityA');
+            $sourceEntityAColumn = $sourceHasTypo ? 'enitityA' : 'entityA';
+
+            // Determine column names in target table (may have typo)
+            $targetHasTypo = $this->columnExistsForMigration($targetTable, 'enitityA');
+            $targetEntityAColumn = $targetHasTypo ? 'enitityA' : 'entityA';
+
+            // Insert data from source into target, ignoring duplicates
+            $this->connection->statement("
+                INSERT IGNORE INTO `{$targetTable}` (
+                    `{$targetEntityAColumn}`, `entityAType`, `entityB`, `entityBType`,
+                    `relationship`, `createdOn`, `createdBy`, `meta`
+                )
+                SELECT
+                    `{$sourceEntityAColumn}`, `entityAType`, `entityB`, `entityBType`,
+                    `relationship`, `createdOn`, `createdBy`, `meta`
+                FROM `{$sourceTable}`
+            ");
+
+            // Drop the source (plural) table
+            $this->connection->statement("DROP TABLE `{$sourceTable}`");
+
+        } catch (\Exception $e) {
+            Log::error('Migration 30410: Failed to merge tables: '.$e->getMessage());
+        }
+    }
+
+    /**
+     * Create the entity_relationship table with correct schema
+     */
+    private function createEntityRelationshipTable(): void
+    {
+        $this->connection->statement('
+            CREATE TABLE `zp_entity_relationship` (
+                `id` INT NOT NULL AUTO_INCREMENT,
+                `entityA` INT NULL,
+                `entityAType` VARCHAR(45) NULL,
+                `entityB` INT NULL,
+                `entityBType` VARCHAR(45) NULL,
+                `relationship` VARCHAR(45) NULL,
+                `createdOn` DATETIME NULL,
+                `createdBy` INT NULL,
+                `meta` TEXT NULL,
+                PRIMARY KEY (`id`),
+                INDEX `entityA` (`entityA` ASC, `entityAType` ASC, `relationship` ASC),
+                INDEX `entityB` (`entityB` ASC, `entityBType` ASC, `relationship` ASC)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        ');
+    }
+
+    /**
+     * Fix the entityA column typo if it exists
+     */
+    private function fixEntityAColumnTypo(string $tableName): void
+    {
+        try {
+            if ($this->columnExistsForMigration($tableName, 'enitityA')) {
+                $this->connection->statement(
+                    "ALTER TABLE `{$tableName}` CHANGE COLUMN `enitityA` `entityA` INT NULL"
+                );
+            }
+        } catch (\Exception $e) {
+            Log::error("Migration 30410: Failed to fix column typo in {$tableName}: ".$e->getMessage());
+        }
+    }
+
+    /**
+     * Ensure the entityA index exists with correct columns
+     */
+    private function ensureEntityAIndex(string $tableName): void
+    {
+        try {
+            // Drop the old index if it exists (it may reference the wrong column)
+            if ($this->indexExistsForMigration($tableName, 'entityA')) {
+                $this->connection->statement("ALTER TABLE `{$tableName}` DROP INDEX `entityA`");
+            }
+
+            // Create the index with correct columns
+            $this->connection->statement(
+                "ALTER TABLE `{$tableName}` ADD INDEX `entityA` (`entityA` ASC, `entityAType` ASC, `relationship` ASC)"
+            );
+        } catch (\Exception $e) {
+            Log::error("Migration 30410: Failed to ensure entityA index on {$tableName}: ".$e->getMessage());
+        }
+    }
+
+    public function update_sql_30411(): bool|array
+    {
+        $errors = [];
+
+        $sql = [
+            // Add color column to zp_canvas for notebook color support
+            'ALTER TABLE `zp_canvas` ADD COLUMN `color` VARCHAR(50) DEFAULT \'ocean\' AFTER `description`;',
+        ];
+
+        foreach ($sql as $statement) {
+            try {
+                $this->connection->statement($statement);
+            } catch (\Exception $e) {
+                Log::error($statement.' Failed: '.$e->getMessage());
+                Log::error($e);
+                // Don't fail for duplicate column
+                if (! str_contains($e->getMessage(), 'Duplicate column name')) {
+                    array_push($errors, $statement.' Failed: '.$e->getMessage());
+                }
+            }
+        }
+
+        return count($errors) ? $errors : true;
+    }
+
+    /**
+     * Migration 30412: Safety net for zp_entity_relationship table
+     *
+     * This migration acts as a final safety net for users who may have had issues
+     * with migration 30410. It performs the same checks and fixes using the shared
+     * helper methods to ensure the table is in the correct state.
+     *
+     * Since 30410 is now robust and idempotent, this migration will typically
+     * find everything already correct and simply return true.
+     *
+     * @return bool Always returns true to prevent blocking subsequent migrations
+     */
+    public function update_sql_30412(): bool|array
+    {
+        $pluralTable = 'zp_entity_relationships';
+        $singularTable = 'zp_entity_relationship';
+
+        try {
+            $pluralExists = $this->tableExistsForMigration($pluralTable);
+            $singularExists = $this->tableExistsForMigration($singularTable);
+
+            // Handle any remaining plural table issues
+            if ($pluralExists && $singularExists) {
+                $this->mergeEntityRelationshipTables($pluralTable, $singularTable);
+            } elseif ($pluralExists && ! $singularExists) {
+                $this->connection->statement("RENAME TABLE `{$pluralTable}` TO `{$singularTable}`");
+            } elseif (! $pluralExists && ! $singularExists) {
+                $this->createEntityRelationshipTable();
+
+                return true;
+            }
+
+            // Ensure column and index are correct
+            $this->fixEntityAColumnTypo($singularTable);
+            $this->ensureEntityAIndex($singularTable);
+
+        } catch (\Exception $e) {
+            Log::error('Migration 30412: '.$e->getMessage());
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30413: Final fix for zp_entity_relationship table
+     *
+     * This migration ensures all users get the entity_relationship table fix,
+     * including those whose DB version was already recorded as 30412+ due to
+     * previous failed or partial migrations.
+     *
+     * Since all the helper methods are idempotent, this will simply verify
+     * the table is correct (doing nothing if already fixed) or apply the fix
+     * if still needed.
+     *
+     * @return bool Always returns true to prevent blocking subsequent migrations
+     */
+    public function update_sql_30413(): bool|array
+    {
+        $pluralTable = 'zp_entity_relationships';
+        $singularTable = 'zp_entity_relationship';
+
+        try {
+            $pluralExists = $this->tableExistsForMigration($pluralTable);
+            $singularExists = $this->tableExistsForMigration($singularTable);
+
+            // Handle any remaining plural table issues
+            if ($pluralExists && $singularExists) {
+                $this->mergeEntityRelationshipTables($pluralTable, $singularTable);
+            } elseif ($pluralExists && ! $singularExists) {
+                $this->connection->statement("RENAME TABLE `{$pluralTable}` TO `{$singularTable}`");
+            } elseif (! $pluralExists && ! $singularExists) {
+                $this->createEntityRelationshipTable();
+
+                return true;
+            }
+
+            // Ensure column and index are correct
+            $this->fixEntityAColumnTypo($singularTable);
+            $this->ensureEntityAIndex($singularTable);
+
+        } catch (\Exception $e) {
+            Log::error('Migration 30413: '.$e->getMessage());
+        }
+
+        return true;
+    }
+
+    /**
+     * Add performance indexes for frequently-queried columns.
+     *
+     * - zp_tickets.dependingTicketId: Used in every subtask query (was full table scan)
+     * - zp_tickethistory.ticketId: Used in ticket history lookups
+     * - zp_read (userId, module, moduleId): Table had zero indexes
+     * - zp_relationuserproject (userId, projectId): Used in auth checks
+     * - zp_comment (moduleId, module, date): Used in "latest comment" queries
+     */
+    public function update_sql_30500(): bool|array
+    {
+        $indexes = [
+            ['table' => 'zp_tickets', 'columns' => ['dependingTicketId'], 'name' => 'idx_tickets_dependingTicketId'],
+            ['table' => 'zp_tickethistory', 'columns' => ['ticketId'], 'name' => 'idx_tickethistory_ticketId'],
+            ['table' => 'zp_read', 'columns' => ['userId', 'module', 'moduleId'], 'name' => 'idx_read_userId_module_moduleId'],
+            ['table' => 'zp_relationuserproject', 'columns' => ['userId', 'projectId'], 'name' => 'idx_relationuserproject_userId_projectId'],
+            ['table' => 'zp_comment', 'columns' => ['moduleId', 'module', 'date'], 'name' => 'idx_comment_moduleId_module_date'],
+        ];
+
+        foreach ($indexes as $index) {
+            try {
+                if (! Schema::hasTable($index['table'])) {
+                    continue;
+                }
+
+                // Check if index already exists before adding
+                $existingIndexes = collect(
+                    $this->connection->select("SHOW INDEX FROM `{$index['table']}`")
+                )->pluck('Key_name')->unique()->toArray();
+
+                if (! in_array($index['name'], $existingIndexes)) {
+                    Schema::table($index['table'], function (Blueprint $table) use ($index) {
+                        $table->index($index['columns'], $index['name']);
+                    });
+                }
+            } catch (\Exception $e) {
+                Log::error("Migration 30500: Failed to add index {$index['name']} on {$index['table']}: ".$e->getMessage());
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30501: Ensure zp_canvas.color column exists
+     *
+     * Migration 30411 added this column but could fail silently on MySQL servers
+     * with ANSI_QUOTES sql_mode due to DEFAULT "ocean" using double quotes
+     * (interpreted as identifier, not string literal). The SQL was fixed in #3284
+     * but users who already ran the broken migration have the DB version advanced
+     * past 30411 without the column actually existing.
+     *
+     * @return bool|array Returns true on success, array of errors on failure
+     */
+    public function update_sql_30501(): bool|array
+    {
+        try {
+            if (Schema::hasTable('zp_canvas') && ! Schema::hasColumn('zp_canvas', 'color')) {
+                Schema::table('zp_canvas', function (Blueprint $table) {
+                    $table->string('color', 50)->nullable()->default('ocean')->after('description');
+                });
+            }
+        } catch (\Exception $e) {
+            Log::error('Migration 30501: '.$e->getMessage());
+
+            return ['Migration 30501 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30502: Create the WorkStructure tables (structures, elements,
+     * relationships, mappings) for the meta-model that orchestrates entities
+     * across domains. Mirrors SchemaBuilder::createWorkStructureTables().
+     *
+     * @return bool|array Returns true on success, array of errors on failure
+     */
+    public function update_sql_30502(): bool|array
+    {
+        try {
+            if (! Schema::hasTable('zp_work_structures')) {
+                Schema::create('zp_work_structures', function (Blueprint $table) {
+                    $table->id();
+                    $table->string('title', 255);
+                    $table->text('description')->nullable();
+                    $table->string('type', 50)->default('custom');
+                    $table->integer('created_by')->nullable();
+                    $table->json('meta')->nullable();
+                    $table->dateTime('created_at')->nullable();
+                    $table->dateTime('modified_at')->nullable();
+
+                    $table->unique(['title'], 'idx_work_structures_title');
+                    $table->index(['type'], 'idx_work_structures_type');
+                });
+            }
+
+            if (! Schema::hasTable('zp_work_structure_elements')) {
+                Schema::create('zp_work_structure_elements', function (Blueprint $table) {
+                    $table->id();
+                    $table->unsignedBigInteger('structure_id');
+                    $table->string('type_key', 50);
+                    $table->string('label', 100);
+                    $table->text('description')->nullable();
+                    $table->string('domain_reference', 255)->nullable();
+                    $table->integer('sort_order')->default(0);
+                    $table->json('meta')->nullable();
+                    $table->dateTime('created_at')->nullable();
+
+                    $table->index(['structure_id'], 'idx_wse_structure_id');
+                    $table->unique(['structure_id', 'type_key'], 'idx_wse_structure_type_key');
+                });
+            }
+
+            if (! Schema::hasTable('zp_work_structure_relationships')) {
+                Schema::create('zp_work_structure_relationships', function (Blueprint $table) {
+                    $table->id();
+                    $table->unsignedBigInteger('structure_id');
+                    $table->unsignedBigInteger('from_element_id');
+                    $table->unsignedBigInteger('to_element_id');
+                    $table->string('relationship_type', 50);
+                    $table->text('description')->nullable();
+                    $table->json('meta')->nullable();
+
+                    $table->index(['structure_id'], 'idx_wsr_structure_id');
+                });
+            }
+
+            if (! Schema::hasTable('zp_work_structure_mappings')) {
+                Schema::create('zp_work_structure_mappings', function (Blueprint $table) {
+                    $table->id();
+                    $table->unsignedBigInteger('source_structure_id');
+                    $table->unsignedBigInteger('source_element_id');
+                    $table->unsignedBigInteger('target_structure_id');
+                    $table->unsignedBigInteger('target_element_id');
+                    $table->string('mapping_type', 50)->default('generates');
+                    $table->json('meta')->nullable();
+
+                    $table->index(['source_structure_id', 'target_structure_id'], 'idx_wsm_source_target');
+                    // Enforce the same idempotency key StructureRegistry::registerMappings()
+                    // checks in application code, so a race can't insert a duplicate mapping
+                    // for the same source element → target structure.
+                    $table->unique(['source_structure_id', 'source_element_id', 'target_structure_id'], 'idx_wsm_unique_mapping');
+                });
+            }
+        } catch (\Exception $e) {
+            Log::error('Migration 30502: '.$e->getMessage());
+
+            return ['Migration 30502 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Push notification fields on zp_access_tokens — refactor of the
+     * original (never-fired-in-production) zp_device_tokens table from
+     * the earlier #3401 design. Per discussion: lifecycle is naturally
+     * tied to the user's login session, so we piggyback the bearer-
+     * token row instead of maintaining a parallel table + prune cron.
+     * Logout invalidates the row → push registration dies with it.
+     *
+     * Columns added to zp_access_tokens:
+     *   - push_token            VARCHAR(255) NULL — opaque token (Expo
+     *                                              or FCM, see provider)
+     *   - push_platform         VARCHAR(16)  NULL — 'ios' or 'android'
+     *   - push_provider         VARCHAR(8)   NULL — 'expo' or 'fcm'
+     *   - push_token_updated_at TIMESTAMP    NULL — refreshed each
+     *                                              registerPushToken call
+     *   - push_invalidated_at   TIMESTAMP    NULL — set by mobile
+     *                                              unregister OR provider
+     *                                              DeviceNotRegistered
+     *
+     * The zp_device_tokens table from #3401's update_sql_30503 is no
+     * longer used. Installs that ran 30503 will have an empty
+     * zp_device_tokens table sitting unused — safe to drop in a
+     * future cleanup PR; not dropped here to keep this migration
+     * additive-only.
+     */
+    public function update_sql_30504(): bool|array
+    {
+        try {
+            Schema::table('zp_access_tokens', function (Blueprint $table) {
+                if (! Schema::hasColumn('zp_access_tokens', 'push_token')) {
+                    $table->string('push_token', 255)->nullable()->after('expires_at');
+                }
+                if (! Schema::hasColumn('zp_access_tokens', 'push_platform')) {
+                    $table->string('push_platform', 16)->nullable()->after('push_token');
+                }
+                if (! Schema::hasColumn('zp_access_tokens', 'push_provider')) {
+                    $table->string('push_provider', 8)->nullable()->after('push_platform');
+                }
+                if (! Schema::hasColumn('zp_access_tokens', 'push_token_updated_at')) {
+                    $table->timestamp('push_token_updated_at')->nullable()->after('push_provider');
+                }
+                if (! Schema::hasColumn('zp_access_tokens', 'push_invalidated_at')) {
+                    $table->timestamp('push_invalidated_at')->nullable()->after('push_token_updated_at');
+                }
+            });
+
+            // Index for "active push tokens for user" — the dominant
+            // access pattern when dispatching push. Skipped if it
+            // already exists from a re-run.
+            $existingIndexes = collect(\Illuminate\Support\Facades\DB::select('SHOW INDEX FROM zp_access_tokens'))
+                ->pluck('Key_name')
+                ->toArray();
+            if (! in_array('idx_access_tokens_tokenable_push', $existingIndexes, true)) {
+                Schema::table('zp_access_tokens', function (Blueprint $table) {
+                    $table->index(
+                        ['tokenable_id', 'push_invalidated_at'],
+                        'idx_access_tokens_tokenable_push'
+                    );
+                });
+            }
+        } catch (\Exception $e) {
+            Log::error('Migration 30504: '.$e->getMessage());
+
+            return ['Migration 30504 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30505: Create the native permission engine tables (zp_roles,
+     * zp_permissions, zp_role_permissions — mirrors SchemaBuilder), then sync the
+     * discovered `domain.action` vocabulary and seed the six built-in roles with their
+     * default grants. Idempotent.
+     *
+     * @return bool|array Returns true on success, array of errors on failure
+     */
+    public function update_sql_30505(): bool|array
+    {
+        try {
+            // The legacy zp_roles rights table was dropped at update_sql_30002. If a stale
+            // copy survives on a very old install it lacks the 'level' column — replace it.
+            if (Schema::hasTable('zp_roles') && ! Schema::hasColumn('zp_roles', 'level')) {
+                Schema::drop('zp_roles');
+            }
+
+            if (! Schema::hasTable('zp_roles')) {
+                Schema::create('zp_roles', function (Blueprint $table) {
+                    $table->id();
+                    $table->string('name', 50);
+                    $table->string('displayName', 100)->nullable();
+                    $table->integer('level');
+                    $table->tinyInteger('isSystem')->default(0);
+                    $table->text('description')->nullable();
+                    $table->dateTime('createdOn')->nullable();
+                    $table->dateTime('modified')->nullable();
+
+                    $table->unique(['name'], 'idx_roles_name');
+                    $table->index(['level'], 'idx_roles_level');
+                });
+            }
+
+            if (! Schema::hasTable('zp_permissions')) {
+                Schema::create('zp_permissions', function (Blueprint $table) {
+                    $table->id();
+                    $table->string('permissionKey', 150);
+                    $table->string('domain', 60);
+                    $table->string('action', 100);
+                    $table->string('label', 191)->nullable();
+                    $table->tinyInteger('isProjectScoped')->default(1);
+                    $table->dateTime('createdOn')->nullable();
+                    $table->dateTime('modified')->nullable();
+
+                    $table->unique(['permissionKey'], 'idx_permissions_key');
+                    $table->index(['domain'], 'idx_permissions_domain');
+                });
+            }
+
+            if (! Schema::hasTable('zp_role_permissions')) {
+                Schema::create('zp_role_permissions', function (Blueprint $table) {
+                    $table->id();
+                    $table->unsignedBigInteger('roleId');
+                    $table->unsignedBigInteger('permissionId');
+
+                    $table->unique(['roleId', 'permissionId'], 'idx_role_permissions_unique');
+                    $table->index(['roleId'], 'idx_role_permissions_roleId');
+                    $table->index(['permissionId'], 'idx_role_permissions_permissionId');
+                });
+            }
+
+            // Populate the vocabulary, then grant the built-in roles their defaults.
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30505: '.$e->getMessage());
+
+            return ['Migration 30505 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30506: the Users domain joined the native permission engine. Re-sync the
+     * discovered permission catalog (adds users.view/create/edit/delete/import, all
+     * company-wide) and re-seed the built-in role grants. The engine tables already exist
+     * (created in 30505), so this is table-creation-free. Both seeder calls are idempotent and
+     * additive — re-running never removes an admin's customized zp_role_permissions rows.
+     */
+    public function update_sql_30506(): bool|array
+    {
+        try {
+            // The discovered-provider list is cached cross-request (installation store) outside
+            // debug mode. An install that already ran 30505 cached it WITHOUT UsersPermissions
+            // (which didn't exist then) — seeding against that stale list would never create the
+            // users.* permissions, leaving admin/owner/manager with no user-management grants
+            // (and, with enforcement on, 403'd out of user management). Flush it first.
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30506: '.$e->getMessage());
+
+            return ['Migration 30506 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30507: the Clients domain joined the native permission engine. Re-sync the
+     * discovered permission catalog (adds clients.view/create/edit/delete, all company-wide)
+     * and re-seed the built-in role grants (admin/owner auto-grant clients.* via the company
+     * wildcard). Table-creation-free; idempotent + additive. Flush the discovered-provider
+     * cache first — an install that already ran 30505/30506 cached the provider list WITHOUT
+     * ClientsPermissions, so seeding against that stale list would never create clients.*.
+     */
+    public function update_sql_30507(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30507: '.$e->getMessage());
+
+            return ['Migration 30507 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30508: the Setting domain joined the native permission engine. Re-sync the
+     * discovered permission catalog (adds company.settings.view/edit + projectsettings.labels.manage)
+     * and re-seed the built-in role grants. Table-creation-free; idempotent + additive. Flush the
+     * discovered-provider cache first — an install that already ran 30505-30507 cached the provider
+     * list WITHOUT SettingPermissions, so seeding against that stale list would never create the
+     * new keys (admins would lose the company-settings screen, managers the label dialog).
+     */
+    public function update_sql_30508(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30508: '.$e->getMessage());
+
+            return ['Migration 30508 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30509: the Sprints domain joined the native permission engine. Re-sync the
+     * discovered permission catalog (adds sprints.view/create/edit/delete, all project-scoped)
+     * and re-seed the built-in role grants — the standard verbs auto-grant via the existing
+     * project rules (readonly view; editor create/edit/delete; manager+ all). Table-creation-free;
+     * idempotent + additive. Flush the discovered-provider cache first — an install that already
+     * ran 30505-30508 cached the provider list WITHOUT SprintsPermissions, so seeding against that
+     * stale list would never create the sprints.* keys (and lower roles would lose sprint access).
+     */
+    public function update_sql_30509(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30509: '.$e->getMessage());
+
+            return ['Migration 30509 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30510: the Wiki domain joined the native permission engine. Re-sync the discovered
+     * permission catalog (adds wiki.view/create/edit/delete, all project-scoped) and re-seed the
+     * built-in role grants — the standard verbs auto-grant via the existing project rules (readonly
+     * view; editor create/edit/delete; manager+ all). Table-creation-free; idempotent + additive.
+     * Flush the discovered-provider cache first — an install that already ran 30505-30509 cached the
+     * provider list WITHOUT WikiPermissions, so seeding against that stale list would never create
+     * the wiki.* keys (and lower roles would lose wiki access).
+     */
+    public function update_sql_30510(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30510: '.$e->getMessage());
+
+            return ['Migration 30510 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Migration 30511: the Ideas domain joined the native permission engine. Re-sync the discovered
+     * permission catalog (adds ideas.view/create/edit/delete, all project-scoped) and re-seed the
+     * built-in role grants — the standard verbs auto-grant via the existing project rules (readonly
+     * view; editor create/edit/delete; manager+ all). Table-creation-free; idempotent + additive.
+     * Flush the discovered-provider cache first — an install that already ran 30505-30510 cached the
+     * provider list WITHOUT IdeasPermissions, so seeding against that stale list would never create
+     * the ideas.* keys (and lower roles would lose idea access).
+     */
+    public function update_sql_30511(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30511: '.$e->getMessage());
+
+            return ['Migration 30511 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Sync the permission catalog + re-seed built-in role grants for the Blueprints (canvas)
+     * domain. Adds blueprints.view/create/edit/delete (all project-scoped); the standard verbs
+     * auto-grant via the existing project rules (readonly view; editor create/edit/delete;
+     * manager+ all). Table-creation-free; idempotent + additive.
+     *
+     * Flush the discovered-provider cache FIRST — an install that already ran the earlier
+     * permission migrations cached the provider list WITHOUT BlueprintsPermissions, so seeding
+     * against that stale list would never create the blueprints.* keys (and every role would
+     * then be denied canvas access, since currentUserCan requires the role to hold the key).
+     */
+    public function update_sql_30512(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30512: '.$e->getMessage());
+
+            return ['Migration 30512 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Sync the permission catalog + re-seed built-in role grants for the Goalcanvas (Goals)
+     * domain. Adds goals.view/create/edit/delete (all project-scoped); the standard verbs
+     * auto-grant via the existing project rules (readonly view; editor create/edit/delete;
+     * manager+ all). Table-creation-free; idempotent + additive.
+     *
+     * Flush the discovered-provider cache FIRST — an install that already ran the earlier
+     * permission migrations cached the provider list WITHOUT GoalcanvasPermissions, so seeding
+     * against that stale list would never create the goals.* keys (and every role would then be
+     * denied goal access, since currentUserCan requires the role to hold the key).
+     */
+    public function update_sql_30513(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30513: '.$e->getMessage());
+
+            return ['Migration 30513 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Sync the permission catalog + re-seed built-in role grants for the Timesheets domain. Adds
+     * timesheets.view/create/edit/delete/manage (all GLOBAL-scoped — company-wide time logging).
+     *
+     * This migration MUST re-seed because the DefaultRolePermissions matrix changed: editor now
+     * gains the four global timesheets keys (own-time) and manager gains timesheets.manage
+     * (company-wide invoicing/reports/others' time). Without re-seeding, those roles would not
+     * hold the new keys and the timesheet pages/API would deny everyone below admin.
+     *
+     * Flush the discovered-provider cache FIRST so TimesheetsPermissions is rediscovered.
+     */
+    public function update_sql_30514(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30514: '.$e->getMessage());
+
+            return ['Migration 30514 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Sync the permission catalog + re-seed built-in role grants for the Files domain. Adds
+     * files.view/upload/delete (all project-scoped).
+     *
+     * No DefaultRolePermissions matrix edit was needed — these are standard project verbs that
+     * auto-grant through the existing rules (view→readonly+, upload→commenter+, delete→editor+,
+     * manager+ via the project wildcard, admin/owner via scope:any). The re-seed is still required
+     * so the new keys land in zp_role_permissions for the built-in roles.
+     *
+     * Flush the discovered-provider cache FIRST so FilesPermissions is rediscovered.
+     */
+    public function update_sql_30515(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30515: '.$e->getMessage());
+
+            return ['Migration 30515 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Sync the permission catalog + re-seed built-in role grants for the Reports domain. Adds
+     * reports.view (project-scoped standard verb → auto-grants readonly+; no
+     * DefaultRolePermissions matrix edit). The re-seed lands the new key in zp_role_permissions
+     * for the built-in roles.
+     *
+     * Flush the discovered-provider cache FIRST so ReportsPermissions is rediscovered.
+     */
+    public function update_sql_30516(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30516: '.$e->getMessage());
+
+            return ['Migration 30516 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Sync the permission catalog + re-seed built-in role grants for the Calendar domain. Adds
+     * calendar.view/create/edit/delete (project-scoped standard verbs → auto-grant readonly+/editor+)
+     * and calendar.manage (global → admin+ via scope:any). NO DefaultRolePermissions matrix edit:
+     * all verbs auto-grant. The re-seed lands the new keys in zp_role_permissions for the built-ins.
+     *
+     * Flush the discovered-provider cache FIRST so CalendarPermissions is rediscovered.
+     */
+    public function update_sql_30517(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30517: '.$e->getMessage());
+
+            return ['Migration 30517 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+
+    /**
+     * Sync the permission catalog + re-seed built-in role grants for the Projects domain. Adds
+     * projects.view (project-scoped → readonly+) and projects.create/edit/delete (GLOBAL → manager+
+     * via an explicit DefaultRolePermissions rule; admin/owner via scope:any).
+     *
+     * This migration MUST re-seed because the matrix CHANGED (manager gains the three global
+     * projects keys). Without re-seeding, managers would not hold projects.create/edit/delete and
+     * project management would deny everyone below admin.
+     *
+     * Flush the discovered-provider cache FIRST so ProjectsPermissions is rediscovered.
+     */
+    public function update_sql_30518(): bool|array
+    {
+        try {
+            app(\Leantime\Core\Auth\Permissions\PermissionRegistry::class)->flush();
+
+            $seeder = app(\Leantime\Core\Auth\Permissions\PermissionSeeder::class);
+            $seeder->syncDiscoveredPermissions();
+            $seeder->seedBuiltInRoles();
+        } catch (\Exception $e) {
+            Log::error('Migration 30518: '.$e->getMessage());
+
+            return ['Migration 30518 failed: '.$e->getMessage()];
+        }
+
+        return true;
+    }
+}

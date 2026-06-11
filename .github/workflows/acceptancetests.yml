@@ -1,0 +1,30 @@
+name: Acceptance Tests (Selenium)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "master", "*.*-dev" ]
+  pull_request:
+    branches: [ "master", "*.*-dev" ]
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: redis, gd, ldap, mbstring, pdo_mysql, zip, bcmath, exif, pcntl
+
+      - name: Run Acceptance Tests
+        run: make acceptance-test-ci
+
+      - name: Store screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: acceptance-test
+          path: tests/_output

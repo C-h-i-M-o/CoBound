@@ -1,0 +1,17 @@
+.git
+.github
+.dev
+.docker
+node_modules
+vendor
+target
+storage/logs/*
+storage/framework/cache/*
+storage/framework/sessions/*
+storage/framework/views/*
+userfiles/*
+public/userfiles/*
+config/.env
+.env
+.env.*
+*.tar.gz

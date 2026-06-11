@@ -1,0 +1,22 @@
+<div class="center padding-lg">
+
+    <div class="row">
+        <div class="col-md-12">
+            <div style='width:50%' class='svgContainer'>
+                {!! file_get_contents(ROOT . '/dist/images/svg/undraw_real_time_collaboration_c62i.svg') !!}
+            </div>
+            <h3 class="primaryColor">{{ __('onboarding.wiki_title') }}</h3><br />
+            <p>{!! __('onboarding.wiki_intro') !!}</p>
+            <br />
+        </div>
+    </div>
+
+
+    <div class="row">
+        <div class="col-md-12">
+
+        </div>
+    </div>
+
+
+</div>
